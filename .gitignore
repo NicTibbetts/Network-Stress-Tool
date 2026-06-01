@@ -1,0 +1,6 @@
+*.bak
+*.log
+*.json*
+*.attack
+*\
+*.cl*

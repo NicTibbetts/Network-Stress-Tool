@@ -1,0 +1,16 @@
+# fleet_hosts.example one host per line for fleet.sh
+# format: [user@]host[:ssh_port]
+# blank lines and lines starting with # are ignored.
+#
+# these must be machines YOU control/are authorized to use, with key based
+# SSH access already set up (fleet.sh runs ssh in BatchMode no password prompts).
+
+# user@host
+root@198.51.100.10
+root@198.51.100.11
+
+# host with a non default SSH port
+admin@203.0.113.5:2222
+
+# bare host (uses your ssh config/default user)
+loadbox-eu-1.example.net
