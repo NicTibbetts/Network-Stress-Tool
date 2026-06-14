@@ -1,8 +1,13 @@
 package main
 
 import (
+	"net"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // attacks_test.go covers the pure helpers that don't need live network access:
@@ -108,6 +113,69 @@ func TestParseTargetForUDP_InvalidFormat(t *testing.T) {
 
 // ---- generateCacheBustingURL ----
 
+func TestLoadBundledReflectorCorpus_ParsesSections(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "reflectors.txt")
+	content := strings.Join([]string{
+		"[dns]",
+		"1.1.1.1",
+		"# comment",
+		"2.2.2.2",
+		"[ntp]",
+		"3.3.3.3",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	corpus, err := loadBundledReflectorCorpus(path)
+	if err != nil {
+		t.Fatalf("loadBundledReflectorCorpus() error = %v", err)
+	}
+	if got := len(corpus["dns"]); got != 2 {
+		t.Fatalf("len(corpus[dns]) = %d, want 2", got)
+	}
+	if got := len(corpus["ntp"]); got != 1 {
+		t.Fatalf("len(corpus[ntp]) = %d, want 1", got)
+	}
+	if got := corpus["dns"][0].String(); got != "1.1.1.1" {
+		t.Fatalf("corpus[dns][0] = %q, want 1.1.1.1", got)
+	}
+}
+
+func TestNormalizeDiscoverWorkers_UsesSafeCap(t *testing.T) {
+	if got := normalizeDiscoverWorkers(0); got < 8 || got > 64 {
+		t.Fatalf("normalizeDiscoverWorkers(0) = %d, want a conservative 8..64 worker range", got)
+	}
+	if got := normalizeDiscoverWorkers(5000); got != 64 {
+		t.Fatalf("normalizeDiscoverWorkers(5000) = %d, want 64", got)
+	}
+}
+
+func TestProbeSeedCandidates_UsesExplicitSeedsAndFiltersDuplicates(t *testing.T) {
+	seedIPs := []net.IP{
+		net.ParseIP("1.1.1.1"),
+		net.ParseIP("1.1.1.1"),
+		net.ParseIP("2.2.2.2"),
+	}
+
+	var seen []string
+	candidates := probeSeedCandidates("dns", seedIPs, time.Now().Add(time.Second), func(ip net.IP) (bool, int, int) {
+		seen = append(seen, ip.String())
+		return true, 12, 34
+	})
+
+	if len(candidates) != 2 {
+		t.Fatalf("len(candidates) = %d, want 2", len(candidates))
+	}
+	if len(seen) != 2 {
+		t.Fatalf("probe count = %d, want 2", len(seen))
+	}
+	if candidates[0].Protocol != "dns" {
+		t.Fatalf("candidate protocol = %q, want dns", candidates[0].Protocol)
+	}
+}
+
 func TestGenerateCacheBustingURL_ContainsBase(t *testing.T) {
 	base := "http://example.com/page"
 	got := generateCacheBustingURL(base)
@@ -121,6 +189,38 @@ func TestGenerateCacheBustingURL_AddsQueryParams(t *testing.T) {
 	got := generateCacheBustingURL(base)
 	if !strings.Contains(got, "?") && !strings.Contains(got, "&") {
 		t.Errorf("generateCacheBustingURL: result %q contains no query params", got)
+	}
+}
+
+type stubLogger struct {
+	warningCalls int
+	infoCalls    int
+}
+
+func (s *stubLogger) Warning(msg string) { s.warningCalls++ }
+func (s *stubLogger) Info(msg string)    { s.infoCalls++ }
+
+func TestLogReflectionFallbackWarning_OnlyOnce(t *testing.T) {
+	reflectionFallbackWarningOnce = sync.Once{}
+	logger := &stubLogger{}
+
+	logReflectionFallbackWarning(logger)
+	logReflectionFallbackWarning(logger)
+
+	if logger.warningCalls != 1 {
+		t.Fatalf("warning calls = %d, want 1", logger.warningCalls)
+	}
+}
+
+func TestLogDirectFloodInfo_OnlyOnce(t *testing.T) {
+	directFloodInfoOnce = sync.Once{}
+	logger := &stubLogger{}
+
+	logDirectFloodInfo(logger, "test")
+	logDirectFloodInfo(logger, "test")
+
+	if logger.infoCalls != 1 {
+		t.Fatalf("info calls = %d, want 1", logger.infoCalls)
 	}
 }
 

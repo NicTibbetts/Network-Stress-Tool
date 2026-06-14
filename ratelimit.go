@@ -1,21 +1,25 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"math"
 	mathrand "math/rand"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 type RateLimitDetector struct {
 	config *DemonConfig
 	logger *Logger
 
-	// Detection state
+	// Detection state. currentDelay holds the most recent effective delay
+	// (base plus backoff plus jitter) so the reported statistic matches what
+	// callers actually wait, not a constant.
 	consecutiveLimits int
 	lastLimitTime     time.Time
 	currentDelay      time.Duration
@@ -23,17 +27,16 @@ type RateLimitDetector struct {
 
 	// Pattern recognition
 	responsePatterns map[string]int
-	timingPatterns   []time.Duration
 
-	// Bypass strategies
+	// Burst pacing
 	burstCounter  int
 	lastBurstTime time.Time
-	backoffLevel  int
 
-	// Statistics
-	totalRequests      uint64
-	limitDetections    uint64
-	successfulBypasses uint64
+	// Statistics. recoveries counts the times a limit streak ended with a clean
+	// response, that is a real, observable outcome of backing off.
+	totalRequests   uint64
+	limitDetections uint64
+	recoveries      uint64
 
 	mu sync.RWMutex
 }
@@ -45,14 +48,17 @@ func NewRateLimitDetector(config *DemonConfig, logger *Logger) *RateLimitDetecto
 		currentDelay:     config.BypassSettings.MinDelay,
 		adaptiveRate:     config.RequestRate,
 		responsePatterns: make(map[string]int),
-		timingPatterns:   make([]time.Duration, 0, 100),
 	}
 }
 
-// DetectRateLimit analyzes response to detect rate limiting
+// DetectRateLimit analyzes a response to decide whether the target is limiting
+// us. it relies on explicit signals, the configured status codes and rate-limit
+// headers, plus a couple of cheap header heuristics. it deliberately does not
+// treat a slow response as a limit: when this tool is doing its job the target
+// slows down because it's saturated, not because it's throttling, so latency is
+// the wrong signal here.
 func (rld *RateLimitDetector) DetectRateLimit(resp *http.Response, responseTime time.Duration) bool {
 	rld.mu.Lock()
-	defer rld.mu.Unlock()
 
 	rld.totalRequests++
 	isRateLimited := false
@@ -75,46 +81,44 @@ func (rld *RateLimitDetector) DetectRateLimit(resp *http.Response, responseTime 
 		}
 	}
 
-	// Check response time threshold
-	if !isRateLimited && responseTime > rld.config.BypassSettings.ResponseTimeThresh {
-		isRateLimited = true
-	}
-
-	// Advanced pattern detection
+	// Header-name heuristics as a last resort
 	if !isRateLimited {
-		isRateLimited = rld.detectAdvancedPatterns(resp, responseTime)
+		isRateLimited = rld.detectAdvancedPatterns(resp)
 	}
 
+	var logConsecutive int
 	if isRateLimited {
 		rld.limitDetections++
 		rld.consecutiveLimits++
 		rld.lastLimitTime = time.Now()
-
-		if rld.logger != nil {
-			rld.logger.Warning(fmt.Sprintf("[!] rate limit detected: Status: %d, Response time: %v, Consecutive: %d",
-				resp.StatusCode, responseTime, rld.consecutiveLimits))
-		}
+		logConsecutive = rld.consecutiveLimits
 	} else {
+		// a clean response after a streak of limits means the backoff worked and
+		// the target is serving us again, that's a recovery worth recording.
+		if rld.consecutiveLimits > 0 {
+			rld.recoveries++
+		}
 		rld.consecutiveLimits = 0
 	}
 
-	// Update timing patterns for machine learning
-	rld.updateTimingPatterns(responseTime)
+	rld.mu.Unlock()
+
+	// log after releasing the lock. holding the detector's write lock across a
+	// synchronous log write would stall every other worker behind file I/O.
+	if isRateLimited && rld.logger != nil {
+		rld.logger.Warning(fmt.Sprintf("[!] rate limit detected: status %d, response time %v, consecutive %d",
+			resp.StatusCode, responseTime, logConsecutive))
+	}
 
 	return isRateLimited
 }
 
-// detectAdvancedPatterns uses ML-like pattern recognition to detect rate limiting
-func (rld *RateLimitDetector) detectAdvancedPatterns(resp *http.Response, responseTime time.Duration) bool {
-	// Analyze response body size patterns (rate limited responses are often smaller)
-	contentLength := resp.Header.Get("Content-Length")
-	if contentLength != "" {
-		if length, err := strconv.Atoi(contentLength); err == nil && length < 100 {
-			return true // Suspiciously small response
-		}
-	}
-
-	// Check for common rate limit keywords in headers
+// detectAdvancedPatterns applies cheap header heuristics as a best-effort signal
+// when the status code and configured header triggers don't fire. it is not ML,
+// just a keyword scan over header names plus a check for an unusually varied
+// Server header. callers hold the write lock, it mutates responsePatterns.
+func (rld *RateLimitDetector) detectAdvancedPatterns(resp *http.Response) bool {
+	// Check for common rate limit keywords in header names
 	suspiciousHeaders := []string{
 		"X-Rate-Limit", "Rate-Limit", "X-RateLimit", "RateLimit",
 		"Throttle", "Quota", "Retry-After", "Too-Many", "Limit-Exceeded",
@@ -128,11 +132,11 @@ func (rld *RateLimitDetector) detectAdvancedPatterns(resp *http.Response, respon
 		}
 	}
 
-	// Analyze server header patterns (some servers change behavior when rate limiting)
+	// Some rate-limiting proxies swap the Server header. A high variety across a
+	// single run can indicate we're being shuffled between edge nodes.
 	server := resp.Header.Get("Server")
 	if server != "" {
 		rld.responsePatterns[server]++
-		// If server header changes frequently, might indicate rate limiting proxy
 		if len(rld.responsePatterns) > 5 {
 			return true
 		}
@@ -141,49 +145,16 @@ func (rld *RateLimitDetector) detectAdvancedPatterns(resp *http.Response, respon
 	return false
 }
 
-// updateTimingPatterns maintains a rolling window of response times for analysis
-func (rld *RateLimitDetector) updateTimingPatterns(responseTime time.Duration) {
-	rld.timingPatterns = append(rld.timingPatterns, responseTime)
-
-	// Keep only last 100 timings
-	if len(rld.timingPatterns) > 100 {
-		rld.timingPatterns = rld.timingPatterns[1:]
-	}
-
-	// Detect sudden response time increases (rate limiting symptom)
-	if len(rld.timingPatterns) >= 10 {
-		recent := rld.timingPatterns[len(rld.timingPatterns)-5:]
-		earlier := rld.timingPatterns[len(rld.timingPatterns)-10 : len(rld.timingPatterns)-5]
-
-		recentAvg := calculateAverageTime(recent)
-		earlierAvg := calculateAverageTime(earlier)
-
-		// If recent responses are 3x slower, might be rate limiting
-		if recentAvg > earlierAvg*3 {
-			// This is detected as suspicious but not definitive
-		}
-	}
-}
-
-// calculateAverageTime calculates average response time
-func calculateAverageTime(times []time.Duration) time.Duration {
-	if len(times) == 0 {
-		return 0
-	}
-
-	var total time.Duration
-	for _, t := range times {
-		total += t
-	}
-	return total / time.Duration(len(times))
-}
-
-// GetBypassDelay calculates optimal delay to bypass rate limits
+// GetBypassDelay returns the delay to apply before the next request, growing it
+// with each consecutive limit and adding jitter so a fleet of workers doesn't
+// march in lockstep. The base is always MinDelay (the backoff multiplies that,
+// not the previous result, so the delay can't compound across calls). The final
+// value is recorded in currentDelay so the reported statistic is the real one.
 func (rld *RateLimitDetector) GetBypassDelay() time.Duration {
-	rld.mu.RLock()
-	defer rld.mu.RUnlock()
+	rld.mu.Lock()
+	defer rld.mu.Unlock()
 
-	baseDelay := rld.currentDelay
+	baseDelay := rld.config.BypassSettings.MinDelay
 
 	// Apply backoff if recently rate limited
 	if rld.consecutiveLimits > 0 {
@@ -198,7 +169,7 @@ func (rld *RateLimitDetector) GetBypassDelay() time.Duration {
 		baseDelay = backoffDelay
 	}
 
-	// Add random variation to avoid pattern detection
+	// Add jitter so concurrent workers spread out instead of synchronising
 	variation := rld.config.BypassSettings.RandomVariation
 	if variation > 0 {
 		randomFactor := 1.0 + (mathrand.Float64()-0.5)*2*variation
@@ -210,6 +181,7 @@ func (rld *RateLimitDetector) GetBypassDelay() time.Duration {
 		baseDelay = rld.config.BypassSettings.MinDelay
 	}
 
+	rld.currentDelay = baseDelay
 	return baseDelay
 }
 
@@ -277,54 +249,57 @@ func (rld *RateLimitDetector) GetStatistics() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"total_requests":      rld.totalRequests,
-		"limit_detections":    rld.limitDetections,
-		"successful_bypasses": rld.successfulBypasses,
-		"success_rate":        successRate,
-		"consecutive_limits":  rld.consecutiveLimits,
-		"current_delay":       rld.currentDelay,
-		"adaptive_rate":       rld.adaptiveRate,
-		"backoff_level":       rld.backoffLevel,
+		"total_requests":     rld.totalRequests,
+		"limit_detections":   rld.limitDetections,
+		"recoveries":         rld.recoveries,
+		"success_rate":       successRate,
+		"consecutive_limits": rld.consecutiveLimits,
+		"current_delay":      rld.currentDelay,
+		"adaptive_rate":      rld.adaptiveRate,
 	}
 }
 
-// IntelligentDelayManager provides sophisticated timing control
+// IntelligentDelayManager paces the global request stream. It uses a token
+// bucket rather than a mutex held across a sleep: callers wait concurrently on
+// the bucket instead of serialising behind whichever goroutine is sleeping.
 type IntelligentDelayManager struct {
-	config      *DemonConfig
-	detector    *RateLimitDetector
-	lastRequest time.Time
-	mu          sync.Mutex
+	config   *DemonConfig
+	detector *RateLimitDetector
+	limiter  *rate.Limiter
 }
 
 func NewIntelligentDelayManager(config *DemonConfig, detector *RateLimitDetector) *IntelligentDelayManager {
+	start := config.BypassSettings.MinDelay
+	if start <= 0 {
+		start = time.Millisecond
+	}
 	return &IntelligentDelayManager{
 		config:   config,
 		detector: detector,
+		limiter:  rate.NewLimiter(rate.Every(start), 1),
 	}
 }
 
-// WaitForOptimalTiming waits for the optimal time to send next request
-func (idm *IntelligentDelayManager) WaitForOptimalTiming() {
-	idm.mu.Lock()
-	defer idm.mu.Unlock()
-
-	if idm.config.RateLimitBypass {
-		delay := idm.detector.GetBypassDelay()
-
-		// Distributed timing - spread requests across time
-		if idm.config.DistributedTiming {
-			delay = idm.applyDistributedTiming(delay)
-		}
-
-		// Wait since last request
-		elapsed := time.Since(idm.lastRequest)
-		if elapsed < delay {
-			remaining := delay - elapsed
-			time.Sleep(remaining)
-		}
+// WaitForOptimalTiming blocks until the token bucket allows the next request.
+// The bucket's rate tracks the detector's backoff, so it tightens as limits
+// accumulate and relaxes as the target recovers. Because rate.Limiter is
+// concurrency-safe and never holds a lock across the wait, many workers can be
+// pacing at once without serialising behind each other.
+func (idm *IntelligentDelayManager) WaitForOptimalTiming(ctx context.Context) {
+	if !idm.config.RateLimitBypass {
+		return
 	}
 
-	idm.lastRequest = time.Now()
+	delay := idm.detector.GetBypassDelay()
+	if idm.config.DistributedTiming {
+		delay = idm.applyDistributedTiming(delay)
+	}
+	if delay <= 0 {
+		return
+	}
+
+	idm.limiter.SetLimit(rate.Every(delay))
+	_ = idm.limiter.WaitN(ctx, 1)
 }
 
 // applyDistributedTiming adds sophisticated timing patterns

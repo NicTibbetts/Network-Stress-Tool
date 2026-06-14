@@ -1,0 +1,57 @@
+# bundled reflector seed corpus for type-10 reflection mode
+# this file is intentionally plain text so it can be edited or extended.
+# sections are parsed by the runtime and used as the built-in seed inventory.
+# this is a starter inventory, not a live reflector database.
+# if you already have a real reflector list, prefer passing it with -dns-amplifiers
+# and the other -*-amplifiers flags instead of relying on this file alone.
+
+[dns]
+80.80.80.80
+80.80.81.81
+77.88.8.8
+77.88.8.1
+114.114.114.114
+114.114.115.115
+119.29.29.29
+180.76.76.76
+101.101.101.101
+76.76.19.19
+76.223.100.101
+185.228.168.9
+74.82.42.42
+156.154.70.1
+156.154.71.1
+1.2.4.8
+210.2.4.8
+223.5.5.5
+223.6.6.6
+117.50.10.10
+117.50.11.11
+52.58.31.114
+109.69.8.51
+84.200.69.80
+84.200.70.40
+
+[ntp]
+195.13.1.152
+193.204.114.232
+130.149.17.21
+91.189.94.4
+91.189.91.157
+5.135.84.61
+194.57.169.1
+193.67.79.202
+195.148.127.1
+216.171.112.36
+45.32.230.95
+195.82.148.130
+46.28.200.132
+185.255.55.20
+
+[memcached]
+
+[ssdp]
+
+[chargen]
+
+[qotd]

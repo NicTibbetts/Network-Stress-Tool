@@ -50,6 +50,7 @@ type AttackConfig struct {
 	// so old configs and the zero value still work.
 	HTTP2Connections int // type 2, h2 connections to fan streams across
 	BombSizeBytes    int // type 7, decompressed gzip-bomb size in bytes
+	UDPPacketsPerSec int // type 10 direct flood, aggregate packet-rate cap (<=0 = built-in 100k default)
 }
 
 // errRateLimited is returned by advancedHTTPCall when the server sends a 429.
@@ -521,7 +522,7 @@ func advancedWorker(ctx context.Context, id int, jobs <-chan string,
 
 			// Intelligent rate limit bypass timing
 			if delayManager != nil && globalDemonConfig != nil && globalDemonConfig.RateLimitBypass {
-				delayManager.WaitForOptimalTiming()
+				delayManager.WaitForOptimalTiming(ctx)
 			}
 
 			// Rate limiting - track workers waiting

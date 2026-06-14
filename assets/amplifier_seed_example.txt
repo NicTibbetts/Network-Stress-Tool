@@ -1,0 +1,10 @@
+# Example reflector seed list for -dns-amplifiers / -ntp-amplifiers / ...
+# One IPv4 address per line.
+# Blank lines and lines starting with # are ignored.
+# This file is the explicit inventory you provide yourself.
+# The bundled corpus file is a separate starter inventory shipped with the repo.
+# You can also paste a Shodan/Censys export directly into this file.
+
+# replace these placeholders with your own verified reflector inventory
+# 1.1.1.1
+# 2.2.2.2

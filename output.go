@@ -189,6 +189,23 @@ func computeImpact(attempts, successful, responding uint64, latencyDegr float64)
 	return math.Min(100*latencyDegr*conf, 100.0)
 }
 
+// asInt coerces a stats map value (which may be int, uint64, int64 or float64
+// depending on the source) into an int, returning 0 for anything unexpected.
+func asInt(v interface{}) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case uint64:
+		return int(n)
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	default:
+		return 0
+	}
+}
+
 // renderFrame draws ONE in-place dashboard frame as a single buffered write: cursor
 // home (no \033[2J full-clear, which is what flickers), each line erased to its end
 // (\033[K, so a shorter line can't leave stale tail characters), and the screen
@@ -267,6 +284,7 @@ func writeStatsTable(w io.Writer, targetURL string, attackType uint8) {
 	// Get current stats
 	successful := atomic.LoadUint64(&successfulHits)
 	failed := failedRequests.Load()
+	udpLocal := atomic.LoadUint64(&udpLocalSendAttempts)
 	bytesSent := atomic.LoadUint64(&totalBytesSent)
 	responding := atomic.LoadUint64(&targetResponding)
 	responseTime := atomic.LoadUint64(&lastResponseTime)
@@ -276,12 +294,14 @@ func writeStatsTable(w io.Writer, targetURL string, attackType uint8) {
 	congestion := atomic.LoadUint64(&localCongestion)
 	slowloris := atomic.LoadUint64(&slowlorisActive)
 
-	// total requests/packets attempted across all workers, the honest denominator
+	// total requests/packets attempted across all workers, the real denominator
 	// for both success rate and the volume metric. NOT totalConnections, which counts
 	// dispatched jobs: one job can fan out to 100 HTTP/2 streams or hundreds of UDP
 	// packets, so mixing that per-job count with the per-request success/failure
-	// counters produced nonsense like a 470587% success rate.
-	attempts := successful + failed
+	// counters produced nonsense like a 470587% success rate. the blind UDP path
+	// contributes raw handoff attempts here, but not measured success, so the UI
+	// no longer pretends a local socket write equals a verified target hit.
+	attempts := successful + failed + udpLocal
 	var successRate float64 = 0
 	if attempts > 0 {
 		successRate = float64(successful) / float64(attempts) * 100
@@ -295,7 +315,7 @@ func writeStatsTable(w io.Writer, targetURL string, attackType uint8) {
 		uptime = float64(okChecks) / float64(measurable) * 100
 	}
 
-	// latencyDegr (0-1) is the heart of the honest impact metric: how badly the
+	// latencyDegr (0-1) is the heart of the impact metric: how badly the
 	// target is crawling under our load, measured from the attack traffic's OWN
 	// round-trip times rather than a separate probe or a raw volume count. timeouts
 	// are recorded at full duration so they land in the slow tail; a fast 403/429
@@ -323,6 +343,11 @@ func writeStatsTable(w io.Writer, targetURL string, attackType uint8) {
 		// apart from a real red "down". the impact line + caveat below carry the detail.
 		status = "[uplink maxed]"
 		statusColor = "\033[35m"
+	case atomic.LoadUint64(&udpModeActive) == 1 && atomic.LoadUint64(&udpMeasured) == 0:
+		// UDP run we can't independently measure (no receiver agent, no probe reply).
+		// neutral, not a green "up": we're sending, but can't confirm target impact.
+		status = "[unmeasured]"
+		statusColor = "\033[35m"
 	case latencyDegr >= 0.5:
 		// the target is crawling under our traffic, over half our round-trips are
 		// slow, and control hosts are fine, so this is the target, not our link.
@@ -339,7 +364,6 @@ func writeStatsTable(w io.Writer, targetURL string, attackType uint8) {
 		"Volume Attack", "Slowloris", "HTTP/2 Flood", "Cache Busting",
 		"API Fuzzing", "WAF Bypass", "Protocol Exploits", "Bandwidth Saturation",
 		"Connection Exhaustion", "Resource Exhaustion", "UDP Flood",
-		
 	}
 
 	currentAttack := "Unknown"
@@ -368,6 +392,37 @@ func writeStatsTable(w io.Writer, targetURL string, attackType uint8) {
 		formatNumber(attempts), formatNumber(successful), formatNumber(failed), successRate)
 	fmt.Fprintf(w, " Data Transmitted:  %12s │ Response Time: %8dms │ Health Checks: %8s                     \n",
 		formatBytes(bytesSent), responseTime, formatNumber(healthChecks))
+
+	verifiedReflectors, requestBytes, responseBytes := reflectorManager.Summary("")
+	fmt.Fprintf(w, " UDP REFLECTOR TELEMETRY  verified:%-8s req-bytes:%-10s rsp-bytes:%-10s handoff:%-8s\n",
+		formatNumber(uint64(verifiedReflectors)), formatBytes(requestBytes), formatBytes(responseBytes), formatNumber(udpLocal))
+
+	// UDP send/landed split: a local socket Write is "what left this box",
+	// NOT a verified target hit. SEND = sent-side rate; RECV = what a receiver agent
+	// on the target actually absorbed (the only real loss measurement). Without an
+	// agent we say so plainly rather than implying impact we can't see. Shown
+	// whenever this run has sent UDP, so the HTTP labels above stay untouched.
+	if atomic.LoadUint64(&udpModeActive) == 1 || udpLocal > 0 {
+		sendPPS := atomic.LoadUint64(&udpSendPPS)
+		sendBPS := atomic.LoadUint64(&udpSendBPS)
+		sendErrs := atomic.LoadUint64(&udpLocalSendFailures)
+		capNote := ""
+		if ppsCap := atomic.LoadUint64(&udpPPSCap); ppsCap > 0 && sendPPS >= ppsCap*9/10 {
+			capNote = fmt.Sprintf("  [pps cap binding @ %s — raise -udp-pps]", formatNumber(ppsCap))
+		}
+		fmt.Fprintf(w, "  UDP SEND   packets:%-12s send-errs:%-10s rate:%s pkt/s  %s/s%s\n",
+			formatNumber(udpLocal), formatNumber(sendErrs), formatNumber(sendPPS), formatBytes(sendBPS), capNote)
+
+		if atomic.LoadUint64(&udpRecvActive) == 1 {
+			recvPPS := atomic.LoadUint64(&udpRecvPPS)
+			recvBPS := atomic.LoadUint64(&udpRecvBPS)
+			lossPct := float64(atomic.LoadUint64(&udpLossPPM)) / 10000.0
+			fmt.Fprintf(w, "  UDP RECV   (agent) rate:%s pkt/s  %s/s  │ landed:%6.2f%%  loss:%6.2f%%\n",
+				formatNumber(recvPPS), formatBytes(recvBPS), 100-lossPct, lossPct)
+		} else if atomic.LoadUint64(&udpModeActive) == 1 {
+			fmt.Fprintf(w, "  UDP RECV   no receiver agent — SEND is sent-side only (not proof of landing); run `-udp-receiver :PORT` on the target + `-receiver-stats host:PORT` here for real loss\n")
+		}
+	}
 
 	// when the attack saturates our OWN uplink, the health monitor (which shares it)
 	// can't reach the target OR known-good control hosts. that does NOT mean "no
@@ -459,6 +514,11 @@ func writeStatsTable(w io.Writer, targetURL string, attackType uint8) {
 		targetHealth = "[degraded] "
 	case congestion == 1:
 		targetHealth = "[unknown]  "
+	case atomic.LoadUint64(&udpModeActive) == 1 && atomic.LoadUint64(&udpMeasured) == 0:
+		// UDP run with no receiver agent and no probe signal: we genuinely can't see
+		// the target's state, so don't paint a green [up]. The UDP SEND/RECV block
+		// above shows what we DO know (sent-side rate).
+		targetHealth = "[unmeasured]"
 	case lat.avgLatencyMs > 2000:
 		targetHealth = "[slow]     "
 	default:
@@ -469,49 +529,34 @@ func writeStatsTable(w io.Writer, targetURL string, attackType uint8) {
 		effectivenessColor, effectivenessStatus, overallEffectiveness,
 		targetHealth, effectivenessColor, effectivenessStatus)
 
-	// Rate limiting detection status
+	// Rate limiting detection status. recoveries is the count of times a limit
+	// streak ended with a clean response, that is, our backoff actually worked.
+	// consecutive is the current unbroken run of limits, so it tells you whether
+	// we're being throttled right now or have already recovered.
 	if rateLimitDetector != nil {
 		stats := rateLimitDetector.GetStatistics()
-		var detections, bypasses int
-
-		if val, ok := stats["limit_detections"]; ok && val != nil {
-			switch v := val.(type) {
-			case float64:
-				detections = int(v)
-			case uint64:
-				detections = int(v)
-			case int:
-				detections = v
-			}
-		}
-		if val, ok := stats["successful_bypasses"]; ok && val != nil {
-			switch v := val.(type) {
-			case float64:
-				bypasses = int(v)
-			case uint64:
-				bypasses = int(v)
-			case int:
-				bypasses = v
-			}
-		}
+		detections := asInt(stats["limit_detections"])
+		recoveries := asInt(stats["recoveries"])
+		consecutive := asInt(stats["consecutive_limits"])
 
 		var rlStatus string
 		var rlColor string
 
-		if detections == 0 {
+		switch {
+		case detections == 0:
 			rlStatus = "NOT DETECTED"
 			rlColor = "\033[32m" // Green
-		} else if bypasses > detections/2 {
-			rlStatus = "DETECTED - BYPASSING"
+		case consecutive > 0:
+			rlStatus = "THROTTLED, BACKING OFF"
 			rlColor = "\033[33m" // Yellow
-		} else {
-			rlStatus = "DETECTED - SITE WINNING"
-			rlColor = "\033[31m" // Red
+		default:
+			rlStatus = "RECOVERED"
+			rlColor = "\033[32m" // Green
 		}
 
 		fmt.Fprintf(w, " RATE LIMITING                                                                                                   \n")
-		fmt.Fprintf(w, " Status: %s%-25s\033[0m │ Detections: %8d │ Bypasses: %8d │ Bypass Rate: %6.1f%% \n",
-			rlColor, rlStatus, detections, bypasses, float64(bypasses)/math.Max(float64(detections), 1)*100)
+		fmt.Fprintf(w, " Status: %s%-25s\033[0m │ Detections: %8d │ Recoveries: %8d │ Backoff streak: %5d \n",
+			rlColor, rlStatus, detections, recoveries, consecutive)
 	}
 
 	// connection-hold attacks (types 1/6/8) don't complete requests, so they never
@@ -605,6 +650,7 @@ func printEffectivenessReport() {
 	responding := atomic.LoadUint64(&targetResponding)
 	successful := atomic.LoadUint64(&successfulHits)
 	failed := failedRequests.Load()
+	udpLocal := atomic.LoadUint64(&udpLocalSendAttempts)
 	genuineFails := healthChecks - okChecks - congChecks // target failed while control hosts stayed up
 
 	if healthChecks == 0 {
@@ -617,7 +663,7 @@ func printEffectivenessReport() {
 	// saturation. this is the signal the old report ignored, which is how a run that
 	// buried the target in 25s timeouts came out as "couldn't measure / target up".
 	lat := demonStats.aggregateSnapshot()
-	attempts := successful + failed
+	attempts := successful + failed + udpLocal
 	var failRate float64
 	if attempts > 0 {
 		failRate = float64(failed) / float64(attempts) * 100
@@ -694,7 +740,6 @@ func printPerTypeSummary() {
 		"Volume Attack", "Slowloris", "HTTP/2 Flood", "Cache Busting",
 		"API Fuzzing", "WAF Bypass", "Protocol Exploits", "Bandwidth Saturation",
 		"Connection Exhaustion", "Resource Exhaustion", "UDP Flood",
-		
 	}
 
 	var active []uint8

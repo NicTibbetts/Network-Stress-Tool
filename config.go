@@ -48,6 +48,17 @@ type DemonConfig struct {
 	BombSizeMB         int `json:"bomb_size_mb"`         // type 7, decompressed size of the gzip bomb, in MB
 	MaxHeldConnections int `json:"max_held_connections"` // types 1/6/8, cap on simultaneously held connections
 	MaxUDPFloods       int `json:"max_udp_floods"`       // type 10, cap on concurrent UDP flood invocations (OS-thread safety backstop)
+	UDPPacketsPerSec   int `json:"udp_packets_per_sec"`  // type 10 direct flood, aggregate packet-rate cap (0 = built-in 100k default)
+
+	// UDPDirect forces type 10 to use the direct, non-spoofed flood against the
+	// target only (this is also the default mode). Kept as an explicit force-direct
+	// that overrides UDPReflection if both are set.
+	UDPDirect bool `json:"udp_direct"`
+
+	// UDPReflection selects the reflection/amplification ATTACK MODE for type 10
+	// (raw sockets, spoofed source IP, third-party amplifiers). Off by default: the
+	// default type-10 mode is the direct, non-spoofed flood against your own target.
+	UDPReflection bool `json:"udp_reflection"`
 
 	// Bandwidth / congestion control, keep a flood from saturating your OWN uplink
 	Bandwidth         string `json:"bandwidth"`          // cap UDP egress (e.g. "40mbit", "5MB", "500kbit"); "" = uncapped
@@ -133,6 +144,9 @@ func DefaultConfig() *DemonConfig {
 		BombSizeMB:         64,
 		MaxHeldConnections: 50000,
 		MaxUDPFloods:       maxConcurrentUDPFloods,
+		UDPPacketsPerSec:   0,     // 0 = built-in 100k pps default for the direct flood
+		UDPDirect:          false, // direct is the default mode; this only force-pins it
+		UDPReflection:      false, // reflection/amplification is opt-in via -udp-reflection
 		Bandwidth:          "", // uncapped by default; set to your uplink to avoid self-congestion
 		AdaptiveBandwidth:  true,
 		TimeoutSettings: TimeoutConfig{

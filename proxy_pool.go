@@ -165,7 +165,7 @@ func (p *ProxyPool) getBuiltInProxy() string {
 	// now we only return a proxy here if Tor is actually running on the local
 	// machine. if it is, socks5 over Tor gives us a real exit node for free.
 	// if it is not, we return an empty string and the worker dials direct.
-	// going direct is honest: the operator knows they need real proxies and can
+	// going direct is deliberate: the operator knows they need real proxies and can
 	// pass -proxies or -rotate-proxy instead of silently burning requests.
 	torAddr := "127.0.0.1:9050"
 	conn, err := net.DialTimeout("tcp", torAddr, 1*time.Second)

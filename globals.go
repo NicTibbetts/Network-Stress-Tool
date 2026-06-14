@@ -22,15 +22,22 @@ var dashboardActive atomic.Bool
 // crash this guards against.
 const maxConcurrentUDPFloods = 8
 
+// resourceBurnThresholdMs marks the latency floor that counts as a real type-9
+// burn signal in the dashboard. responses slower than this are treated as the
+// payload actually doing work rather than being parsed cheaply or rejected.
+const resourceBurnThresholdMs = 500
+
 // Attack patterns and strategies
 var (
-	config            AttackConfig
-	hybridAttackTypes []uint8 // set at startup; len > 1 means workers randomly pick from this pool each job
-	totalBytesSent    uint64
-	totalConnections  uint64
-	successfulHits    uint64
-	failedRequests    atomic.Uint64
-	slowlorisActive   uint64 // Number of active Slowloris connections (type 1)
+	config               AttackConfig
+	hybridAttackTypes    []uint8 // set at startup; len > 1 means workers randomly pick from this pool each job
+	totalBytesSent       uint64
+	totalConnections     uint64
+	successfulHits       uint64
+	udpLocalSendAttempts uint64
+	udpLocalSendFailures uint64
+	failedRequests       atomic.Uint64
+	slowlorisActive      uint64 // Number of active Slowloris connections (type 1)
 
 	// hold attack gauges. types 1/6/8 hold a connection open instead of completing
 	// requests, so they never show up in the per-request latency table, these
@@ -62,7 +69,7 @@ var (
 	// before 8 invocations, so it costs no real throughput.
 	udpFloodSlots = make(chan struct{}, maxConcurrentUDPFloods)
 
-	// compression bomb (type 7) landing signal. the README is honest that this
+	// compression bomb (type 7) landing signal. the README notes that this
 	// type's real-world impact is uncertain, these counters turn "uncertain" into
 	// an observable number. a 413/431/400 means the body was rejected on size/format
 	// before any decompression; anything else means it was at least accepted into
@@ -74,7 +81,7 @@ var (
 	// type 9 (resource exhaustion) "burn" signal. these payloads (XML entity
 	// expansion, deeply nested JSON, ReDoS bait, GraphQL depth bombs) are meant to
 	// cost the server CPU/memory, but whether they land depends entirely on the
-	// target's parsers, the README is honest that it's "speculative." a response
+	// target's parsers, the README notes it's "speculative." a response
 	// slow enough to clear resourceBurnThresholdMs is the observable proxy for the
 	// payload actually doing work, the same move we made for the compression bomb.
 	resourceBurnHits  uint64 // responses slower than resourceBurnThresholdMs

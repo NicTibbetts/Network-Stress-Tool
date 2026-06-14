@@ -12,14 +12,23 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// bwLimiter paces total UDP egress to a byte/sec budget when -bandwidth is set;
-// nil means uncapped. it exists because a single machine cannot send more than its
-// uplink: blasting past line rate just queues and drops at our OWN egress
-// (self congestion), kills our health checks, and delivers nothing extra to the
-// target. pacing to ~line rate is the difference between maximum *effective* output
-// and DoS-ing yourself. set once at startup before any worker runs, so a plain
-// pointer read from the send path is race-free.
+// bwLimiter paces total UDP egress to a byte/sec budget. it exists because a single
+// machine cannot send more than its uplink: blasting past line rate just queues and
+// drops at our OWN egress (self congestion), kills our health checks, and delivers
+// nothing extra to the target. pacing to ~line rate is the difference between
+// maximum *effective* output and DoS-ing yourself.
+//
+// the pointer is installed once at startup before any worker runs, so the plain
+// read in paceEgress is race-free. its RATE, however, is adjusted live by
+// adaptiveCongestionControl (via the limiter's own internal locking): it's backed
+// off when the uplink saturates and ramped back as congestion clears. nil means
+// uncapped (paceEgress becomes a no-op).
 var bwLimiter *rate.Limiter
+
+// defaultUDPEgressBytesPerSec is the conservative UDP egress cap applied when
+// -bandwidth isn't set. UDP is never run truly uncapped, because overshooting your
+// own uplink only self-congests; raise -bandwidth to use more of your pipe.
+const defaultUDPEgressBytesPerSec = 2 * 1024 * 1024
 
 // setBandwidthLimit installs a byte/sec egress pacer (<=0 disables it). burst is
 // kept to ~100ms of budget so pacing stays smooth without stalling, and is always
@@ -93,18 +102,36 @@ func parseBandwidth(s string) (int, error) {
 
 // adaptiveCongestionControl auto-throttles the send rate when the health monitor
 // reports LOCAL congestion (our own uplink saturated, see monitor.go). classic
-// AIMD: multiplicative-decrease the limiter the moment we're self-congesting,
-// additive-increase back toward the configured rate once it clears. this keeps a run
-// from strangling itself even when -bandwidth isn't set, because overshooting our
-// own uplink was never helping the attack anyway, it only hurt this machine.
-func adaptiveCongestionControl(ctx context.Context, limiter *rate.Limiter, baseRate float64, logger *Logger) {
+// AIMD on a single shared fraction: multiplicative-decrease the moment we're
+// self-congesting, additive-increase back toward full once it clears. the fraction
+// is applied to BOTH the HTTP request limiter and the UDP egress limiter, so
+// whichever one the running attack actually uses gets backed off (the idle one is
+// adjusted too but isn't sending, so it has no effect). this keeps a run from
+// strangling itself even when -bandwidth isn't set, because overshooting our own
+// uplink was never helping the attack anyway, it only hurt this machine.
+//
+// udpLimiter may be nil (then only the HTTP limiter is managed). httpBaseRate is in
+// requests/sec, udpBaseRate in bytes/sec; the fraction scales each against its own
+// base so the two different units stay correct.
+func adaptiveCongestionControl(ctx context.Context, httpLimiter *rate.Limiter, httpBaseRate float64, udpLimiter *rate.Limiter, udpBaseRate float64, logger *Logger) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	current := baseRate
-	minRate := math.Max(1, baseRate*0.05) // never throttle below 5% of the set rate
-	step := math.Max(1, baseRate*0.10)    // ramp back up 10% of base per second
+	const (
+		minFrac = 0.05 // never throttle below 5% of the configured rate
+		step    = 0.10 // ramp back up 10% of full per second
+	)
+	frac := 1.0
 	throttled := false
+
+	apply := func() {
+		if httpLimiter != nil {
+			httpLimiter.SetLimit(rate.Limit(math.Max(1, httpBaseRate*frac)))
+		}
+		if udpLimiter != nil {
+			udpLimiter.SetLimit(rate.Limit(math.Max(1, udpBaseRate*frac)))
+		}
+	}
 
 	for {
 		select {
@@ -113,18 +140,18 @@ func adaptiveCongestionControl(ctx context.Context, limiter *rate.Limiter, baseR
 		case <-ticker.C:
 			switch {
 			case atomic.LoadUint64(&localCongestion) == 1:
-				if current > minRate {
-					current = math.Max(minRate, current*0.5)
-					limiter.SetLimit(rate.Limit(current))
+				if frac > minFrac {
+					frac = math.Max(minFrac, frac*0.5)
+					apply()
 					if !throttled {
-						logger.Warning(fmt.Sprintf("local uplink saturated — auto-throttling send rate to %.0f/s to relieve self-congestion", current))
+						logger.Warning(fmt.Sprintf("local uplink saturated — auto-throttling send rate to %.0f%% of configured to relieve self-congestion", frac*100))
 						throttled = true
 					}
 				}
-			case current < baseRate:
-				current = math.Min(baseRate, current+step)
-				limiter.SetLimit(rate.Limit(current))
-				if current >= baseRate && throttled {
+			case frac < 1.0:
+				frac = math.Min(1.0, frac+step)
+				apply()
+				if frac >= 1.0 && throttled {
 					logger.Info("congestion cleared — send rate restored to configured value")
 					throttled = false
 				}

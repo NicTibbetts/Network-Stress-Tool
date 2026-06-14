@@ -24,6 +24,17 @@ var controlHosts = []string{
 }
 
 func healthMonitor(ctx context.Context, target string) {
+	// A UDP-only run can't be measured with an HTTP probe: a HEAD to a pure UDP
+	// service always fails, so the loop below would declare a perfectly healthy
+	// target "down" after three misses (or, if the box also serves HTTP, measure
+	// the wrong port). Hand off to the UDP-aware loop, which only declares "down"
+	// on an explicit ICMP port-unreachable and trusts the receiver agent's landed
+	// traffic when one is running. See udp_measure.go.
+	if atomic.LoadUint64(&udpModeActive) == 1 {
+		udpHealthLoop(ctx, target)
+		return
+	}
+
 	// client for the target probe.
 	client := &http.Client{
 		Timeout: 5 * time.Second,

